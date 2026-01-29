@@ -1,0 +1,26 @@
+[package]
+name = "aqua-soundbin"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rustfft = "6.2"
+num-complex = "0.4"
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+
+[features]
+default = []
+wasm = ["wasm-bindgen", "wasm-bindgen-futures", "js-sys"]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+cpal = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = true
