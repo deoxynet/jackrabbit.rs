@@ -82,6 +82,15 @@ pub struct Decoder {
     // Channel quality report (populated after successful decode)
     last_channel_report: Option<ChannelReport>,
 
+    /// Cyclic prefix length for overhead symbols (preamble, training, header).
+    /// Defaults to CP_LEN (240). Set to a shorter value for wired connections
+    /// where the encoder uses the protocol's CP for overhead symbols.
+    overhead_cp: usize,
+
+    /// Number of training symbols (1 or 2). Defaults to 2 (standard).
+    /// Cable-only modes use 1 to save overhead.
+    training_symbols: usize,
+
     // Diagnostics
     total_samples_fed: u64,
     recent_max_amplitude: f32,
@@ -112,6 +121,8 @@ impl Decoder {
             noise_var_sum: 0.0,
             noise_var_count: 0,
             last_channel_report: None,
+            overhead_cp: params::CP_LEN,
+            training_symbols: params::TRAINING_SYMBOLS,
             total_samples_fed: 0,
             recent_max_amplitude: 0.0,
             recent_rms_sum: 0.0,
@@ -121,9 +132,28 @@ impl Decoder {
         }
     }
 
-    fn data_symbol_phase(phase_delta: f32, data_symbol_index: usize, data_symbol_len: usize) -> f32 {
-        let phase_per_sample = phase_delta / SYMBOL_TOTAL as f32;
-        let base_samples = (TRAINING_SYMBOLS + params::HEADER_SYMBOLS) as f32 * SYMBOL_TOTAL as f32;
+    /// Set the cyclic prefix length for overhead symbols (preamble, training,
+    /// header). Must match what the encoder used. Call before feeding samples.
+    pub fn set_overhead_cp(&mut self, cp_len: usize) {
+        self.overhead_cp = cp_len;
+        self.detector.set_overhead_cp(cp_len);
+    }
+
+    /// Set the number of training symbols (1 or 2).
+    /// Must match what the encoder used. Call before feeding samples.
+    pub fn set_training_symbols(&mut self, n: usize) {
+        assert!(n >= 1 && n <= 2, "Training symbols must be 1 or 2");
+        self.training_symbols = n;
+    }
+
+    /// Overhead symbol total length (FFT + overhead CP).
+    fn overhead_sym_total(&self) -> usize {
+        params::FFT_SIZE + self.overhead_cp
+    }
+
+    fn data_symbol_phase(phase_delta: f32, data_symbol_index: usize, data_symbol_len: usize, overhead_sym_total: usize, training_symbols: usize) -> f32 {
+        let phase_per_sample = phase_delta / overhead_sym_total as f32;
+        let base_samples = (training_symbols + params::HEADER_SYMBOLS) as f32 * overhead_sym_total as f32;
         let data_samples = data_symbol_index as f32 * data_symbol_len as f32;
         (base_samples + data_samples) * phase_per_sample
     }
@@ -255,9 +285,10 @@ impl Decoder {
         // Timeout: if the buffer has grown far beyond what any valid signal
         // needs while in a non-Idle state, we're stuck (corrupted header
         // claiming too many data symbols, or other pathological case).
-        // Max valid signal ≈ 8 symbols preamble + 2 training + 1 header
-        // + ~300 data symbols = ~375K samples. Use 480K as a generous limit.
-        const STUCK_LIMIT: usize = 480_000;
+        // Max valid signal with MAX_PAYLOAD=4095: 8 preamble + 2 training
+        // + 1 header + ~1214 data symbols (BPSK worst case) ≈ 1.5M samples.
+        // Use 2M as a generous limit.
+        const STUCK_LIMIT: usize = 2_000_000;
         if self.state != State::Idle && self.buffer.len() > STUCK_LIMIT {
             self.last_event = "timeout";
             self.reset_for_retry();
@@ -281,7 +312,7 @@ impl Decoder {
                         let preamble_len = self.detector.preamble_len_samples();
                         let preamble_start = offset.saturating_sub(preamble_len);
                         let preamble_slice = &self.buffer[preamble_start..offset];
-                        self.cfo_hz = preamble::estimate_cfo(preamble_slice);
+                        self.cfo_hz = preamble::estimate_cfo_with_cp(preamble_slice, self.overhead_cp);
 
                         // Decompose CFO into integer bins and fractional Hz.
                         // Only correct the fractional part in time domain;
@@ -310,14 +341,14 @@ impl Decoder {
                     }
                 }
                 State::CollectTraining => {
-                    if self.available() < TRAINING_SYMBOLS * SYMBOL_TOTAL {
+                    if self.available() < self.training_symbols * self.overhead_sym_total() {
                         return Vec::new();
                     }
                     self.process_training();
                     self.state = State::CollectHeader;
                 }
                 State::CollectHeader => {
-                    if self.available() < SYMBOL_TOTAL {
+                    if self.available() < self.overhead_sym_total() {
                         return Vec::new();
                     }
                     if !self.process_header() {
@@ -348,13 +379,20 @@ impl Decoder {
     }
 
     fn process_training(&mut self) {
-        // Use wide band for channel estimation so it works for any protocol.
-        // Must cover the widest protocol (WIRED_TURBO: bins 20–460).
-        let bin_start = params::GUARD_BINS;
-        let bin_end = 460;
+        // Use fixed training band for channel estimation so it works for any protocol.
+        // Must cover the widest protocol (WIRED_EXTREME: bins 5–475).
+        let bin_start = params::TRAINING_BIN_START;
+        let bin_end = params::TRAINING_BIN_END;
 
-        let sym1 = self.read_samples(SYMBOL_TOTAL).to_vec();
-        let sym2 = self.read_samples(SYMBOL_TOTAL).to_vec();
+        let overhead_sym = self.overhead_sym_total();
+
+        // Read training symbol(s)
+        let sym1 = self.read_samples(overhead_sym).to_vec();
+        let sym2 = if self.training_symbols >= 2 {
+            Some(self.read_samples(overhead_sym).to_vec())
+        } else {
+            None
+        };
 
         // Detect integer CFO by trying bin offsets [-2, -1, 0, +1, +2]
         // and finding the one that maximizes correlation with the known reference.
@@ -380,32 +418,34 @@ impl Decoder {
                 continue;
             }
 
-            let bins1 = ofdm::analyze_symbol(&sym1, shifted_start, shifted_end);
-            let bins2 = ofdm::analyze_symbol(&sym2, shifted_start, shifted_end);
-
-            // Per-bin correlation with reference for both training symbols
+            let bins1 = ofdm::analyze_symbol_cp(&sym1, shifted_start, shifted_end, self.overhead_cp);
             let corr1: Vec<Complex32> = bins1.iter().zip(reference.iter())
                 .map(|(y, r)| *y * r.conj())
                 .collect();
-            let corr2: Vec<Complex32> = bins2.iter().zip(reference.iter())
-                .map(|(y, r)| *y * r.conj())
-                .collect();
 
-            // Block-coherent sum: coherent within blocks, non-coherent across.
-            // For a 50-sample timing offset, phase rotates 0.327 rad/bin, so a
-            // 4-bin block spans ~1.3 rad (93% coherence). Channel phase from
-            // reverb is also smooth within 4 bins. Between blocks, magnitudes
-            // add regardless of accumulated phase.
             let mut total = 0.0f32;
-            for (blk1, blk2) in corr1.chunks(BLOCK_SIZE).zip(corr2.chunks(BLOCK_SIZE)) {
-                let sum1: Complex32 = blk1.iter().copied().sum();
-                let sum2: Complex32 = blk2.iter().copied().sum();
-                // Phase-align sym2 block to sym1 block, then average
-                let align = sum2 * sum1.conj();
-                let phase = align.im.atan2(align.re);
-                let comp = Complex32::new((-phase).cos(), (-phase).sin());
-                let avg = sum1 + sum2 * comp;
-                total += avg.norm();
+            if let Some(ref s2) = sym2 {
+                let bins2 = ofdm::analyze_symbol_cp(s2, shifted_start, shifted_end, self.overhead_cp);
+                let corr2: Vec<Complex32> = bins2.iter().zip(reference.iter())
+                    .map(|(y, r)| *y * r.conj())
+                    .collect();
+
+                // Block-coherent sum: coherent within blocks, non-coherent across.
+                for (blk1, blk2) in corr1.chunks(BLOCK_SIZE).zip(corr2.chunks(BLOCK_SIZE)) {
+                    let sum1: Complex32 = blk1.iter().copied().sum();
+                    let sum2: Complex32 = blk2.iter().copied().sum();
+                    let align = sum2 * sum1.conj();
+                    let phase = align.im.atan2(align.re);
+                    let comp = Complex32::new((-phase).cos(), (-phase).sin());
+                    let avg = sum1 + sum2 * comp;
+                    total += avg.norm();
+                }
+            } else {
+                // Single training symbol: block-coherent with one symbol only
+                for blk in corr1.chunks(BLOCK_SIZE) {
+                    let sum: Complex32 = blk.iter().copied().sum();
+                    total += sum.norm();
+                }
             }
 
             if total > best_corr {
@@ -419,53 +459,69 @@ impl Decoder {
         // Re-analyze with the best offset
         let adj_start = (bin_start as i32 + best_offset) as usize;
         let adj_end = (bin_end as i32 + best_offset) as usize;
-        let bins1 = ofdm::analyze_symbol(&sym1, adj_start, adj_end);
-        let bins2 = ofdm::analyze_symbol(&sym2, adj_start, adj_end);
+        let bins1 = ofdm::analyze_symbol_cp(&sym1, adj_start, adj_end, self.overhead_cp);
 
-        // Estimate per-symbol phase delta from the training pair.
-        // With integer CFO, each symbol accumulates a phase rotation of
-        // 2π·Δf·SYMBOL_TOTAL/fs. The training pair reveals this as
-        // arg(Σ Y2[k]·conj(Y1[k])).
-        let mut phase_sum = Complex32::new(0.0, 0.0);
-        for (b2, b1) in bins2.iter().zip(bins1.iter()) {
-            phase_sum += *b2 * b1.conj();
+        if let Some(ref s2) = sym2 {
+            let bins2 = ofdm::analyze_symbol_cp(s2, adj_start, adj_end, self.overhead_cp);
+
+            // Estimate per-symbol phase delta from the training pair.
+            let mut phase_sum = Complex32::new(0.0, 0.0);
+            for (b2, b1) in bins2.iter().zip(bins1.iter()) {
+                phase_sum += *b2 * b1.conj();
+            }
+            self.phase_delta = phase_sum.im.atan2(phase_sum.re);
+
+            // Average both training symbols for channel estimation, after
+            // compensating the second symbol for the per-symbol phase rotation.
+            // This gives a 3 dB noise reduction vs using a single symbol.
+            let phase_comp = Complex32::new((-self.phase_delta).cos(), (-self.phase_delta).sin());
+            self.channel_estimate = reference
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| {
+                    if x.norm_sqr() > 1e-10 {
+                        let bins2_comp = bins2[i] * phase_comp;
+                        (bins1[i] + bins2_comp) / (x * 2.0)
+                    } else {
+                        Complex32::new(1.0, 0.0)
+                    }
+                })
+                .collect();
+        } else {
+            // Single training symbol: no phase delta estimation possible.
+            // OK for cable — near-zero CFO, pilot tracking handles residual.
+            self.phase_delta = 0.0;
+
+            // Channel estimate from single symbol only
+            self.channel_estimate = reference
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| {
+                    if x.norm_sqr() > 1e-10 {
+                        bins1[i] / x
+                    } else {
+                        Complex32::new(1.0, 0.0)
+                    }
+                })
+                .collect();
         }
-        self.phase_delta = phase_sum.im.atan2(phase_sum.re);
-
-        // Average both training symbols for channel estimation, after
-        // compensating the second symbol for the per-symbol phase rotation.
-        // This gives a 3 dB noise reduction vs using a single symbol,
-        // which is critical at low SNR.
-        let phase_comp = Complex32::new((-self.phase_delta).cos(), (-self.phase_delta).sin());
-        self.channel_estimate = reference
-            .iter()
-            .enumerate()
-            .map(|(i, &x)| {
-                if x.norm_sqr() > 1e-10 {
-                    let bins2_comp = bins2[i] * phase_comp;
-                    (bins1[i] + bins2_comp) / (x * 2.0)
-                } else {
-                    Complex32::new(1.0, 0.0)
-                }
-            })
-            .collect();
     }
 
     fn process_header(&mut self) -> bool {
-        let sym = self.read_samples(SYMBOL_TOTAL).to_vec();
+        let sym = self.read_samples(self.overhead_sym_total()).to_vec();
         let adj_start = (params::HEADER_BINS_START as i32 + self.integer_cfo_bins) as usize;
         let adj_end = (params::HEADER_BINS_END as i32 + self.integer_cfo_bins) as usize;
-        let bins = ofdm::analyze_symbol(&sym, adj_start, adj_end);
+        let bins = ofdm::analyze_symbol_cp(&sym, adj_start, adj_end, self.overhead_cp);
 
-        let h_offset = adj_start - (params::GUARD_BINS as i32 + self.integer_cfo_bins) as usize;
-        let h_end = adj_end - (params::GUARD_BINS as i32 + self.integer_cfo_bins) as usize;
+        let h_offset = adj_start - (params::TRAINING_BIN_START as i32 + self.integer_cfo_bins) as usize;
+        let h_end = adj_end - (params::TRAINING_BIN_START as i32 + self.integer_cfo_bins) as usize;
         let h_slice = &self.channel_estimate[h_offset..h_end];
         let equalized = channel::equalize(&bins, h_slice);
 
         // Compensate per-symbol phase drift on the header.
-        // The header is 2 symbols after training sym 1 (training1=0, training2=1, header=2).
-        // Data symbols don't need this because differential encoding cancels constant phase.
-        let header_phase = 2.0 * self.phase_delta;
+        // The header is training_symbols positions after training sym 0.
+        // With 2 training: header at index 2; with 1: header at index 1.
+        let header_phase = self.training_symbols as f32 * self.phase_delta;
         let phase_comp = Complex32::new((-header_phase).cos(), (-header_phase).sin());
         let corrected: Vec<Complex32> = equalized.iter().map(|&e| e * phase_comp).collect();
 
@@ -489,7 +545,8 @@ impl Decoder {
         let data_sym_total = config.symbol_total();
         let use_differential = config.modulation != params::Modulation::Qam16
             && config.modulation != params::Modulation::Qam64
-            && config.modulation != params::Modulation::Qam256;
+            && config.modulation != params::Modulation::Qam256
+            && config.modulation != params::Modulation::Qam1024;
 
         let pilot_bins = config.pilot_bins();
         let known_pilots = params::pilot_symbols(pilot_bins.len());
@@ -526,8 +583,8 @@ impl Decoder {
             // Extract data bins
             let bins: Vec<Complex32> = full_spectrum[adj_start..adj_end].to_vec();
 
-            let h_offset = adj_start - (params::GUARD_BINS as i32 + self.integer_cfo_bins) as usize;
-            let h_end = adj_end - (params::GUARD_BINS as i32 + self.integer_cfo_bins) as usize;
+            let h_offset = adj_start - (params::TRAINING_BIN_START as i32 + self.integer_cfo_bins) as usize;
+            let h_end = adj_end - (params::TRAINING_BIN_START as i32 + self.integer_cfo_bins) as usize;
             let h_slice = &self.channel_estimate[h_offset..h_end];
             let equalized = channel::equalize_mmse(&bins, h_slice, noise_var);
 
@@ -536,6 +593,8 @@ impl Decoder {
                 self.phase_delta,
                 self.data_symbols_collected,
                 data_sym_total,
+                self.overhead_sym_total(),
+                self.training_symbols,
             );
             let sym_comp = Complex32::new((-sym_phase).cos(), (-sym_phase).sin());
             let equalized_corrected: Vec<Complex32> = equalized.iter()
@@ -548,7 +607,7 @@ impl Decoder {
                     params::Modulation::Bpsk => (2, 0.0),
                     params::Modulation::Qpsk => (8, 0.0),
                     params::Modulation::Psk8 => (8, 0.0),
-                    params::Modulation::Qam16 | params::Modulation::Qam64 | params::Modulation::Qam256 => unreachable!(),
+                    params::Modulation::Qam16 | params::Modulation::Qam64 | params::Modulation::Qam256 | params::Modulation::Qam1024 => unreachable!(),
                 };
                 modulation::differential_decode_dd(&equalized_corrected, n_phases, phase_offset)
             } else {
@@ -609,9 +668,9 @@ impl Decoder {
                 } else {
                     1e-10
                 };
-                let est_bin_start = (params::GUARD_BINS as i32 + self.integer_cfo_bins).max(0) as usize;
-                let trained_bin_start = (config.bin_start as i32 + self.integer_cfo_bins).max(0) as usize;
-                let trained_bin_end = (config.bin_end as i32 + self.integer_cfo_bins).max(0) as usize;
+                let est_bin_start = (params::TRAINING_BIN_START as i32 + self.integer_cfo_bins).max(0) as usize;
+                let trained_bin_start = (params::TRAINING_BIN_START as i32 + self.integer_cfo_bins).max(0) as usize;
+                let trained_bin_end = (params::TRAINING_BIN_END as i32 + self.integer_cfo_bins).max(0) as usize;
                 self.last_channel_report = Some(adaptive::estimate_channel_quality(
                     &self.channel_estimate,
                     avg_noise_var,
@@ -726,6 +785,7 @@ impl Decoder {
 mod tests {
     use super::*;
     use crate::encoder;
+    use crate::params::SYMBOL_TOTAL;
 
     #[test]
     fn test_decode_encoded_signal() {
@@ -785,7 +845,7 @@ mod tests {
 
     #[test]
     fn test_decode_various_sizes() {
-        for &size in &[1, 16, 64, 128, 256, 512, 1023] {
+        for &size in &[1, 16, 64, 128, 256, 512, 1023, 2048] {
             let payload: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
             let waveform = encoder::encode(&payload, 0, 1.0);
 
@@ -890,16 +950,59 @@ mod tests {
     #[test]
     fn test_phase_scaling_for_short_cp() {
         let phase_delta = 1.0f32;
+        let overhead_sym = SYMBOL_TOTAL;
         let long_len = SYMBOL_TOTAL;
         let short_len = params::FFT_SIZE + params::CP_LEN_SHORT;
 
-        let long0 = Decoder::data_symbol_phase(phase_delta, 0, long_len);
-        let long1 = Decoder::data_symbol_phase(phase_delta, 1, long_len);
+        let long0 = Decoder::data_symbol_phase(phase_delta, 0, long_len, overhead_sym, TRAINING_SYMBOLS);
+        let long1 = Decoder::data_symbol_phase(phase_delta, 1, long_len, overhead_sym, TRAINING_SYMBOLS);
         assert!((long1 - long0 - phase_delta).abs() < 1e-6);
 
-        let short0 = Decoder::data_symbol_phase(phase_delta, 0, short_len);
-        let short1 = Decoder::data_symbol_phase(phase_delta, 1, short_len);
+        let short0 = Decoder::data_symbol_phase(phase_delta, 0, short_len, overhead_sym, TRAINING_SYMBOLS);
+        let short1 = Decoder::data_symbol_phase(phase_delta, 1, short_len, overhead_sym, TRAINING_SYMBOLS);
         let expected = phase_delta * (short_len as f32 / SYMBOL_TOTAL as f32);
         assert!((short1 - short0 - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_decode_single_training_symbol() {
+        // WIRED_TURBO: protocol 13, CP=30
+        let payload = b"single training decode";
+        let proto = 13u8;
+        let config = params::get_protocol(proto);
+        let overhead_cp = config.cp_len;
+
+        let waveform = encoder::encode_max(
+            payload, proto, 1.0,
+            params::PREAMBLE_SYMBOLS_MINIMAL,
+            overhead_cp,
+            1, // single training symbol
+        );
+
+        let mut decoder = Decoder::new();
+        decoder.set_overhead_cp(overhead_cp);
+        decoder.set_training_symbols(1);
+        let result = decoder.feed(&waveform);
+        assert_eq!(result, payload, "Single training symbol loopback failed");
+    }
+
+    #[test]
+    fn test_decode_with_overhead_cp() {
+        // WIRED_TURBO: protocol 13, CP=30
+        let payload = b"overhead cp decode";
+        let proto = 13u8;
+        let config = params::get_protocol(proto);
+        let overhead_cp = config.cp_len; // Use protocol's CP for overhead too
+
+        let waveform = encoder::encode_full(
+            payload, proto, 1.0,
+            params::PREAMBLE_SYMBOLS_SHORT,
+            overhead_cp,
+        );
+
+        let mut decoder = Decoder::new();
+        decoder.set_overhead_cp(overhead_cp);
+        let result = decoder.feed(&waveform);
+        assert_eq!(result, payload, "Overhead CP decode failed for WIRED_TURBO");
     }
 }

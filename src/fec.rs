@@ -110,6 +110,42 @@ pub fn depuncture_three_fourths(soft_bits: &[f32]) -> Vec<f32> {
     out
 }
 
+/// Puncture rate 1/2 code to rate 5/6.
+/// Pattern: [1,1,1,0,0,1,0,0,1,1] repeated — keep 6 of every 10 coded bits.
+pub fn puncture_five_sixths(coded_bits: &[u8]) -> Vec<u8> {
+    let pattern = [true, true, true, false, false, true, false, false, true, true];
+    let mut out = Vec::with_capacity(coded_bits.len() * 3 / 5 + 1);
+    for (i, &bit) in coded_bits.iter().enumerate() {
+        if pattern[i % 10] {
+            out.push(bit);
+        }
+    }
+    out
+}
+
+/// Depuncture soft bits from rate 5/6 back to rate 1/2 (insert 0.0 erasures).
+pub fn depuncture_five_sixths(soft_bits: &[f32]) -> Vec<f32> {
+    let pattern = [true, true, true, false, false, true, false, false, true, true];
+    let mut out = Vec::with_capacity(soft_bits.len() * 5 / 3 + 10);
+    let mut src = 0;
+    let mut pat_idx = 0;
+    while src < soft_bits.len() {
+        if pattern[pat_idx % 10] {
+            out.push(soft_bits[src]);
+            src += 1;
+        } else {
+            out.push(0.0); // erasure
+        }
+        pat_idx += 1;
+    }
+    // Emit trailing erasures to complete the current pattern group
+    while pat_idx % 10 != 0 && !pattern[pat_idx % 10] {
+        out.push(0.0);
+        pat_idx += 1;
+    }
+    out
+}
+
 /// Encode with the given code rate.
 pub fn encode(bits: &[u8], rate: CodeRate) -> Vec<u8> {
     let coded = conv_encode(bits);
@@ -117,6 +153,7 @@ pub fn encode(bits: &[u8], rate: CodeRate) -> Vec<u8> {
         CodeRate::Half => coded,
         CodeRate::TwoThird => puncture(&coded),
         CodeRate::ThreeFourth => puncture_three_fourths(&coded),
+        CodeRate::FiveSixth => puncture_five_sixths(&coded),
     }
 }
 
@@ -205,6 +242,7 @@ pub fn decode(soft_bits: &[f32], expected_info_bits: usize, rate: CodeRate) -> V
         CodeRate::Half => soft_bits.to_vec(),
         CodeRate::TwoThird => depuncture(soft_bits),
         CodeRate::ThreeFourth => depuncture_three_fourths(soft_bits),
+        CodeRate::FiveSixth => depuncture_five_sixths(soft_bits),
     };
     viterbi_decode(&rate_half_soft, expected_info_bits)
 }

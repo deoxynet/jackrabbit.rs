@@ -55,6 +55,10 @@ fn required_snr_db(modulation: Modulation, code_rate: CodeRate, fec_type: FecTyp
         (Modulation::Qam64, CodeRate::ThreeFourth, FecType::Convolutional) => 24.0,
         (Modulation::Qam256, CodeRate::ThreeFourth, FecType::Ldpc) => 28.0,
         (Modulation::Qam256, CodeRate::ThreeFourth, FecType::Convolutional) => 30.0,
+        (Modulation::Qam256, CodeRate::FiveSixth, FecType::Ldpc) => 30.0,
+        (Modulation::Qam1024, CodeRate::ThreeFourth, FecType::Ldpc) => 34.0,
+        (Modulation::Qam1024, CodeRate::ThreeFourth, FecType::Convolutional) => 36.0,
+        (Modulation::Qam1024, CodeRate::FiveSixth, FecType::Ldpc) => 36.0,
         // Conservative fallback for unlisted combinations
         _ => 20.0,
     }
@@ -76,34 +80,21 @@ pub fn estimate_channel_quality(
     trained_bin_end: usize,
 ) -> ChannelReport {
     let noise_var = noise_var.max(1e-10);
-    let bin_offset = est_bin_start as i32 - params::GUARD_BINS as i32;
 
-    // Define the band boundaries used by protocols
+    // Define the band boundaries used by protocols (absolute bin numbers).
     let band_defs: &[(usize, usize, &str)] = &[
-        (20, 80, "audible"),   // 60 carriers
-        (20, 120, "dt"),       // 100 carriers
-        (20, 160, "mt"),       // 140 carriers
-        (20, 320, "ut"),       // 300 carriers
-        (20, 410, "wired_max"),  // 390 carriers (up to 20.5 kHz)
-        (20, 460, "wired_turbo"),// 440 carriers (up to 23 kHz)
+        (20, 80, "audible"),        // 60 carriers
+        (20, 120, "dt"),            // 100 carriers
+        (20, 160, "mt"),            // 140 carriers
+        (20, 320, "ut"),            // 300 carriers
+        (20, 400, "wired"),         // 380 carriers (20 kHz)
+        (5, 475, "wired_extreme"),  // 470 carriers (near-Nyquist, cable only)
     ];
 
     let mut bands = Vec::new();
     for &(bin_start, bin_end, _name) in band_defs {
-        let band_start_i = bin_start as i32 + bin_offset;
-        let band_end_i = bin_end as i32 + bin_offset;
-        if band_start_i < 0 || band_end_i <= band_start_i {
-            bands.push(BandReport {
-                snr_db: f32::NAN,
-                snr_min_db: f32::NAN,
-                num_carriers: bin_end - bin_start,
-            });
-            continue;
-        }
-
-        let band_start = band_start_i as usize;
-        let band_end = band_end_i as usize;
-        let fully_trained = band_start >= trained_bin_start && band_end <= trained_bin_end;
+        // Check that this band is fully within the trained range
+        let fully_trained = bin_start >= trained_bin_start && bin_end <= trained_bin_end;
         if !fully_trained {
             bands.push(BandReport {
                 snr_db: f32::NAN,
@@ -113,8 +104,9 @@ pub fn estimate_channel_quality(
             continue;
         }
 
-        let start_idx = band_start.saturating_sub(est_bin_start);
-        let end_idx = band_end.saturating_sub(est_bin_start).min(channel_est.len());
+        // Index into channel_est (which starts at est_bin_start)
+        let start_idx = bin_start.saturating_sub(est_bin_start);
+        let end_idx = bin_end.saturating_sub(est_bin_start).min(channel_est.len());
 
         if start_idx >= end_idx {
             bands.push(BandReport {

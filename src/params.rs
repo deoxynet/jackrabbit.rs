@@ -8,18 +8,26 @@ pub const CP_LEN: usize = 240;
 pub const CP_LEN_SHORT: usize = 120; // 1/8 of FFT_SIZE, for near-field / low-reverb
 pub const CP_LEN_MINIMAL: usize = 60; // 1.25ms, zero multipath on wired connection
 pub const CP_LEN_ULTRA: usize = 30;  // 0.625ms, minimal guard for clean wired links
+pub const CP_LEN_CABLE: usize = 15; // 0.3125ms, direct cable (zero multipath, handles small clock offset)
 pub const SYMBOL_TOTAL: usize = FFT_SIZE + CP_LEN; // 1200 samples (25ms)
 pub const GUARD_BINS: usize = 20; // 0–1000 Hz unused
+/// Training band covers the widest possible protocol range.
+/// All protocols generate training on this fixed range so the decoder
+/// can estimate the channel before knowing which protocol is in use.
+pub const TRAINING_BIN_START: usize = 5;
+pub const TRAINING_BIN_END: usize = 475;
 pub const PREAMBLE_SYMBOLS: usize = 8;
 pub const PREAMBLE_SYMBOLS_SHORT: usize = 4;
+pub const PREAMBLE_SYMBOLS_MINIMAL: usize = 2; // Cable-only: high-SNR, no multipath
 pub const PREAMBLE_SAMPLES: usize = PREAMBLE_SYMBOLS * SYMBOL_TOTAL; // 9600 (200ms)
 pub const TRAINING_SYMBOLS: usize = 2;
+pub const TRAINING_SYMBOLS_SHORT: usize = 1; // Cable-only: high-SNR, single training symbol
 pub const TRAINING_SAMPLES: usize = TRAINING_SYMBOLS * SYMBOL_TOTAL; // 2400 (50ms)
 pub const HEADER_SYMBOLS: usize = 1;
 pub const HEADER_BINS_START: usize = 20;
 pub const HEADER_BINS_END: usize = 80; // bins 20–79 (60 carriers)
-pub const HEADER_INFO_BITS: usize = 15; // 4-bit proto + 10-bit length + 1-bit parity
-pub const MAX_PAYLOAD: usize = 1023;
+pub const HEADER_INFO_BITS: usize = 18; // 5-bit proto + 12-bit length + 1-bit parity
+pub const MAX_PAYLOAD: usize = 4095;
 pub const RING_BUFFER_SIZE: usize = 131072; // 2^17, ~2.7s at 48kHz
 
 /// Spacing between pilot subcarriers (in bins).
@@ -35,7 +43,8 @@ pub enum Modulation {
     Psk8,  // Phase 1: stubbed as QPSK (2 bits/symbol)
     Qam16, // 4 bits/symbol — Gray-coded 4×4 constellation
     Qam64,  // 6 bits/symbol — Gray-coded 8×8 constellation
-    Qam256, // 8 bits/symbol — Gray-coded 16×16 constellation
+    Qam256,  // 8 bits/symbol — Gray-coded 16×16 constellation
+    Qam1024, // 10 bits/symbol — Gray-coded 32×32 constellation
 }
 
 impl Modulation {
@@ -47,6 +56,7 @@ impl Modulation {
             Modulation::Qam16 => 4,
             Modulation::Qam64 => 6,
             Modulation::Qam256 => 8,
+            Modulation::Qam1024 => 10,
         }
     }
 }
@@ -64,6 +74,7 @@ pub enum CodeRate {
     Half,        // rate 1/2
     TwoThird,    // rate 2/3 (punctured from 1/2)
     ThreeFourth, // rate 3/4 (punctured from 1/2)
+    FiveSixth,   // rate 5/6 (punctured from 1/2, or native LDPC)
 }
 
 impl CodeRate {
@@ -73,6 +84,7 @@ impl CodeRate {
             CodeRate::Half => (1, 2),
             CodeRate::TwoThird => (2, 3),
             CodeRate::ThreeFourth => (3, 4),
+            CodeRate::FiveSixth => (5, 6),
         }
     }
 }
@@ -138,6 +150,14 @@ impl ProtocolConfig {
                         let kept_in_rem = pattern[..remainder].iter().filter(|&&x| x).count();
                         full_groups * 4 + kept_in_rem
                     }
+                    // puncture pattern [1,1,1,0,0,1,0,0,1,1]: keeps 6 out of every 10 bits
+                    CodeRate::FiveSixth => {
+                        let pattern = [true, true, true, false, false, true, false, false, true, true];
+                        let full_groups = rate_half_coded / 10;
+                        let remainder = rate_half_coded % 10;
+                        let kept_in_rem = pattern[..remainder].iter().filter(|&&x| x).count();
+                        full_groups * 6 + kept_in_rem
+                    }
                 }
             }
             FecType::Ldpc => {
@@ -180,14 +200,36 @@ impl ProtocolConfig {
     /// Preamble, training, and header always use the standard CP (SYMBOL_TOTAL).
     /// Data symbols use this protocol's cp_len.
     pub fn total_samples_for(&self, payload_len: usize) -> usize {
+        self.total_samples_for_full(payload_len, PREAMBLE_SYMBOLS, CP_LEN)
+    }
+
+    /// Total samples with configurable preamble count and overhead CP length.
+    pub fn total_samples_for_full(
+        &self,
+        payload_len: usize,
+        preamble_symbols: usize,
+        overhead_cp_len: usize,
+    ) -> usize {
+        self.total_samples_for_max(payload_len, preamble_symbols, overhead_cp_len, TRAINING_SYMBOLS)
+    }
+
+    /// Total samples with all configurable parameters including training symbols.
+    pub fn total_samples_for_max(
+        &self,
+        payload_len: usize,
+        preamble_symbols: usize,
+        overhead_cp_len: usize,
+        training_symbols: usize,
+    ) -> usize {
         let n_data = self.data_symbols_for(payload_len);
-        let fixed_symbols = PREAMBLE_SYMBOLS + TRAINING_SYMBOLS + HEADER_SYMBOLS;
-        fixed_symbols * SYMBOL_TOTAL + n_data * self.symbol_total()
+        let overhead_sym_total = FFT_SIZE + overhead_cp_len;
+        let fixed_symbols = preamble_symbols + training_symbols + HEADER_SYMBOLS;
+        fixed_symbols * overhead_sym_total + n_data * self.symbol_total()
     }
 }
 
 /// All protocol configurations.
-pub static PROTOCOLS: [ProtocolConfig; 16] = [
+pub static PROTOCOLS: [ProtocolConfig; 17] = [
     // Audible: 1–4 kHz → bins 20–80 (60 carriers)
     ProtocolConfig { id: 0, name: "AUDIBLE_NORMAL",  bin_start: 20, bin_end: 80,  modulation: Modulation::Bpsk, code_rate: CodeRate::Half,        fec_type: FecType::Convolutional, cp_len: CP_LEN, pilot_spacing: PILOT_SPACING },
     ProtocolConfig { id: 1, name: "AUDIBLE_FAST",    bin_start: 20, bin_end: 80,  modulation: Modulation::Qpsk, code_rate: CodeRate::Half,        fec_type: FecType::Convolutional, cp_len: CP_LEN, pilot_spacing: PILOT_SPACING },
@@ -206,10 +248,12 @@ pub static PROTOCOLS: [ProtocolConfig; 16] = [
     ProtocolConfig { id: 11, name: "UT_FASTEST",      bin_start: 20, bin_end: 320, modulation: Modulation::Qam16, code_rate: CodeRate::ThreeFourth, fec_type: FecType::Convolutional, cp_len: CP_LEN_SHORT, pilot_spacing: PILOT_SPACING },
     // LDPC protocols
     ProtocolConfig { id: 12, name: "DT_LDPC",         bin_start: 20, bin_end: 120, modulation: Modulation::Qpsk,  code_rate: CodeRate::Half,        fec_type: FecType::Ldpc, cp_len: CP_LEN, pilot_spacing: PILOT_SPACING },
-    ProtocolConfig { id: 13, name: "WIRED_TURBO",      bin_start: 20, bin_end: 460, modulation: Modulation::Qam256, code_rate: CodeRate::ThreeFourth, fec_type: FecType::Ldpc, cp_len: CP_LEN_ULTRA, pilot_spacing: 30 },
-    ProtocolConfig { id: 14, name: "WIRED_MAX",        bin_start: 20, bin_end: 410, modulation: Modulation::Qam64, code_rate: CodeRate::ThreeFourth, fec_type: FecType::Ldpc, cp_len: CP_LEN_MINIMAL, pilot_spacing: 15 },
+    ProtocolConfig { id: 13, name: "WIRED_TURBO",      bin_start: 20, bin_end: 400, modulation: Modulation::Qam256, code_rate: CodeRate::ThreeFourth, fec_type: FecType::Ldpc, cp_len: CP_LEN_ULTRA, pilot_spacing: 30 },
+    ProtocolConfig { id: 14, name: "WIRED_MAX",        bin_start: 20, bin_end: 400, modulation: Modulation::Qam64, code_rate: CodeRate::ThreeFourth, fec_type: FecType::Ldpc, cp_len: CP_LEN_MINIMAL, pilot_spacing: 15 },
     // OTA-robust: audible band, BPSK 1/2 LDPC, full CP, dense pilots
     ProtocolConfig { id: 15, name: "OTA_ROBUST",      bin_start: 20, bin_end: 80,  modulation: Modulation::Bpsk,  code_rate: CodeRate::Half,        fec_type: FecType::Ldpc, cp_len: CP_LEN, pilot_spacing: 5 },
+    // Wired extreme: 3.5mm cable, max throughput. 1024QAM, rate 5/6 LDPC, near-full bandwidth, minimal CP/pilots.
+    ProtocolConfig { id: 16, name: "WIRED_EXTREME",   bin_start: 5,  bin_end: 475, modulation: Modulation::Qam1024, code_rate: CodeRate::FiveSixth,  fec_type: FecType::Ldpc, cp_len: CP_LEN_CABLE, pilot_spacing: 60 },
 ];
 
 pub fn get_protocol(id: u8) -> &'static ProtocolConfig {

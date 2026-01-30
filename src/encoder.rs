@@ -14,7 +14,7 @@ use crate::preamble;
 ///
 /// Returns f32 samples at 48kHz sample rate.
 pub fn encode(payload: &[u8], protocol_id: u8, volume: f32) -> Vec<f32> {
-    encode_with_preamble_symbols(payload, protocol_id, volume, params::PREAMBLE_SYMBOLS)
+    encode_full(payload, protocol_id, volume, params::PREAMBLE_SYMBOLS, params::CP_LEN)
 }
 
 /// Encode with a configurable preamble length (in OFDM symbols).
@@ -24,6 +24,33 @@ pub fn encode_with_preamble_symbols(
     volume: f32,
     preamble_symbols: usize,
 ) -> Vec<f32> {
+    encode_full(payload, protocol_id, volume, preamble_symbols, params::CP_LEN)
+}
+
+/// Encode with configurable preamble length and overhead CP length.
+pub fn encode_full(
+    payload: &[u8],
+    protocol_id: u8,
+    volume: f32,
+    preamble_symbols: usize,
+    overhead_cp_len: usize,
+) -> Vec<f32> {
+    encode_max(payload, protocol_id, volume, preamble_symbols, overhead_cp_len, params::TRAINING_SYMBOLS)
+}
+
+/// Encode with all configurable parameters: preamble count, overhead CP, training symbols.
+///
+/// `overhead_cp_len` controls the cyclic prefix for preamble, training, and
+/// header symbols. Data symbols always use the protocol's own CP.
+/// `training_symbols`: 1 or 2 training symbols (1 for cable, 2 for OTA/default).
+pub fn encode_max(
+    payload: &[u8],
+    protocol_id: u8,
+    volume: f32,
+    preamble_symbols: usize,
+    overhead_cp_len: usize,
+    training_symbols: usize,
+) -> Vec<f32> {
     assert!(!payload.is_empty(), "Payload must not be empty");
     assert!(payload.len() <= params::MAX_PAYLOAD, "Payload too large");
     if protocol_id as usize >= params::PROTOCOLS.len() {
@@ -32,6 +59,7 @@ pub fn encode_with_preamble_symbols(
     assert!(preamble_symbols > 0, "Preamble must have at least 1 symbol");
     if preamble_symbols != params::PREAMBLE_SYMBOLS
         && preamble_symbols != params::PREAMBLE_SYMBOLS_SHORT
+        && preamble_symbols != params::PREAMBLE_SYMBOLS_MINIMAL
     {
         return Vec::new();
     }
@@ -64,14 +92,20 @@ pub fn encode_with_preamble_symbols(
     let mut padded_coded = coded_bits;
     padded_coded.resize(n_data_symbols * coded_bits_per_sym, 0);
 
-    // 6. Generate preamble
-    let preamble_waveform = preamble::generate_preamble_symbols(preamble_symbols);
+    // 6. Generate preamble (using overhead CP)
+    let preamble_waveform = preamble::generate_preamble_symbols_with_cp(preamble_symbols, overhead_cp_len);
 
-    // 7. Generate training symbols
-    let (training_waveform, _) = preamble::generate_training(config.bin_start, config.bin_end);
+    // 7. Generate training symbols (using overhead CP, configurable count)
+    assert!(training_symbols >= 1 && training_symbols <= 2, "Training symbols must be 1 or 2");
+    let (training_waveform, _) = preamble::generate_training_full(
+        params::TRAINING_BIN_START,
+        params::TRAINING_BIN_END,
+        overhead_cp_len,
+        training_symbols,
+    );
 
-    // 8. Generate header symbol
-    let header_waveform = header::encode_header_symbol(protocol_id, payload.len());
+    // 8. Generate header symbol (using overhead CP)
+    let header_waveform = header::encode_header_symbol_with_cp(protocol_id, payload.len(), overhead_cp_len);
 
     // 9. Generate data symbols (using per-protocol CP length)
     let data_sym_total = config.symbol_total();
@@ -81,7 +115,8 @@ pub fn encode_with_preamble_symbols(
     let pilot_syms = params::pilot_symbols(pilot_bins.len());
     let use_differential = config.modulation != params::Modulation::Qam16
         && config.modulation != params::Modulation::Qam64
-        && config.modulation != params::Modulation::Qam256;
+        && config.modulation != params::Modulation::Qam256
+        && config.modulation != params::Modulation::Qam1024;
 
     for sym_idx in 0..n_data_symbols {
         let start = sym_idx * coded_bits_per_sym;
@@ -204,5 +239,44 @@ mod tests {
         let n_data = config.data_symbols_for(payload.len());
         let expected = fixed_symbols * params::SYMBOL_TOTAL + n_data * config.symbol_total();
         assert_eq!(waveform.len(), expected);
+    }
+
+    #[test]
+    fn test_encode_single_training_symbol() {
+        let payload = b"single training";
+        let proto = 13u8; // WIRED_TURBO
+        let config = params::get_protocol(proto);
+        let overhead_cp = config.cp_len;
+        let preamble_symbols = params::PREAMBLE_SYMBOLS_MINIMAL;
+
+        let waveform_2ts = encode_max(payload, proto, 1.0, preamble_symbols, overhead_cp, 2);
+        let waveform_1ts = encode_max(payload, proto, 1.0, preamble_symbols, overhead_cp, 1);
+
+        // Single training should be one overhead symbol shorter
+        let overhead_sym = params::FFT_SIZE + overhead_cp;
+        assert_eq!(
+            waveform_2ts.len() - waveform_1ts.len(), overhead_sym,
+            "Single training should save exactly one overhead symbol"
+        );
+    }
+
+    #[test]
+    fn test_encode_with_overhead_cp() {
+        let payload = b"overhead cp test";
+        let proto = 13; // WIRED_TURBO, cp_len=30
+        let config = params::get_protocol(proto);
+        let overhead_cp = config.cp_len; // Use protocol's CP for overhead too
+        let preamble_symbols = params::PREAMBLE_SYMBOLS_SHORT;
+        let waveform = encode_full(payload, proto, 1.0, preamble_symbols, overhead_cp);
+
+        let overhead_sym_total = params::FFT_SIZE + overhead_cp;
+        let fixed_symbols = preamble_symbols + params::TRAINING_SYMBOLS + params::HEADER_SYMBOLS;
+        let n_data = config.data_symbols_for(payload.len());
+        let expected = fixed_symbols * overhead_sym_total + n_data * config.symbol_total();
+        assert_eq!(waveform.len(), expected, "Waveform length mismatch with overhead CP={}", overhead_cp);
+
+        // Should be shorter than using default CP
+        let default_waveform = encode_with_preamble_symbols(payload, proto, 1.0, preamble_symbols);
+        assert!(waveform.len() < default_waveform.len(), "overhead CP should produce shorter waveform");
     }
 }

@@ -24,6 +24,8 @@ fn main() {
     let mut payload_text = String::from("Hello, OTA loopback!");
     let mut listen_mode = false;
     let mut listen_secs: f64 = 10.0;
+    let mut input_device_name: Option<String> = None;
+    let mut output_device_name: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -36,6 +38,14 @@ fn main() {
                 i += 1;
                 payload_text = args[i].clone();
             }
+            "--input-device" => {
+                i += 1;
+                input_device_name = Some(args[i].clone());
+            }
+            "--output-device" => {
+                i += 1;
+                output_device_name = Some(args[i].clone());
+            }
             "--listen" => {
                 listen_mode = true;
                 if i + 1 < args.len() {
@@ -47,7 +57,7 @@ fn main() {
             }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
-                eprintln!("Usage: ota_loopback [--protocol N] [--payload \"text\"] [--listen [secs]]");
+                eprintln!("Usage: ota_loopback [--protocol N] [--payload \"text\"] [--listen [secs]] [--input-device <name>] [--output-device <name>]");
                 std::process::exit(1);
             }
         }
@@ -95,10 +105,39 @@ fn main() {
     // Set up audio
     let host = cpal::default_host();
 
-    let out_device = host.default_output_device()
-        .expect("No output device found");
-    let in_device = host.default_input_device()
-        .expect("No input device found");
+    let out_device = if let Some(name) = output_device_name {
+        host.output_devices()
+            .expect("Failed to get output devices")
+            .find(|d| d.name().unwrap_or_default().to_lowercase().contains(&name.to_lowercase()))
+            .expect(&format!(
+                "Could not find output device '{}'. Available devices: {:?}",
+                name,
+                host.output_devices()
+                    .unwrap()
+                    .map(|d| d.name().unwrap_or_default())
+                    .collect::<Vec<_>>()
+            ))
+    } else {
+        host.default_output_device()
+            .expect("No default output device found")
+    };
+
+    let in_device = if let Some(name) = input_device_name {
+        host.input_devices()
+            .expect("Failed to get input devices")
+            .find(|d| d.name().unwrap_or_default().to_lowercase().contains(&name.to_lowercase()))
+            .expect(&format!(
+                "Could not find input device '{}'. Available devices: {:?}",
+                name,
+                host.input_devices()
+                    .unwrap()
+                    .map(|d| d.name().unwrap_or_default())
+                    .collect::<Vec<_>>()
+            ))
+    } else {
+        host.default_input_device()
+            .expect("No default input device found")
+    };
 
     eprintln!("Output device: {}", out_device.name().unwrap_or_default());
     eprintln!("Input device: {}", in_device.name().unwrap_or_default());

@@ -35,6 +35,7 @@ pub fn ldpc_block_params(rate: CodeRate) -> (usize, usize) {
     match rate {
         CodeRate::Half => (LDPC_648_R12.k, LDPC_648_R12.n),
         CodeRate::ThreeFourth => (LDPC_648_R34.k, LDPC_648_R34.n),
+        CodeRate::FiveSixth => (LDPC_648_R56.k, LDPC_648_R56.n),
         // Rate 2/3 not used for LDPC but return something valid
         CodeRate::TwoThird => (LDPC_648_R12.k, LDPC_648_R12.n),
     }
@@ -45,6 +46,7 @@ pub fn get_ldpc_code(rate: CodeRate) -> &'static LdpcCode {
     match rate {
         CodeRate::Half => &LDPC_648_R12,
         CodeRate::ThreeFourth => &LDPC_648_R34,
+        CodeRate::FiveSixth => &LDPC_648_R56,
         CodeRate::TwoThird => &LDPC_648_R12, // fallback
     }
 }
@@ -102,6 +104,28 @@ pub static LDPC_648_R34: LdpcCode = LdpcCode {
     m_base: 6,
     n_base: 24,
     base_matrix: &BASE_MATRIX_R34,
+};
+
+// IEEE 802.11n base matrix for N=648, rate 5/6.
+// 4 rows × 24 columns, Z=27. m=4, k=20 (in base), so m*Z=108, k*Z=540, n=648.
+//
+// From IEEE 802.11n-2009 Table R.4 (Z=27).
+#[rustfmt::skip]
+static BASE_MATRIX_R56: [i16; 4 * 24] = [
+   17, 13,  8, 21,  9,  3, 18, 12, 10,  0,  4, 15, 19,  2,  5, 10, 26, 19, 13, 13,  1,  0, -1, -1,
+    3, 12, 11, 14, 11, 25,  5, 18,  0,  9,  2, 26, 26, 10, 24,  7, 14, 20,  4,  2, -1,  0,  0, -1,
+   22, 16,  4,  3, 10, 21, 12,  5, 21, 14, 19,  5, -1,  8,  5, 18, 11,  5,  5, 15,  0, -1,  0,  0,
+    7,  7, 14, 14,  4, 16, 16, 24, 24, 10,  1,  7, 15,  6, 10, 26,  8, 18, 21, 14, -1, -1, -1,  0,
+];
+
+pub static LDPC_648_R56: LdpcCode = LdpcCode {
+    n: 648,
+    k: 540,
+    m: 108,
+    z: Z,
+    m_base: 4,
+    n_base: 24,
+    base_matrix: &BASE_MATRIX_R56,
 };
 
 /// Expand a base matrix entry into a Z×Z circulant permutation matrix.
@@ -623,5 +647,33 @@ mod tests {
             !verify_codeword(&codeword, &LDPC_648_R12),
             "Should detect single bit error"
         );
+    }
+
+    #[test]
+    fn test_ldpc_encode_produces_valid_codeword_r56() {
+        let mut info = vec![0u8; LDPC_648_R56.k];
+        for i in 0..info.len() {
+            info[i] = ((i * 11 + 3) % 2) as u8;
+        }
+        let codeword = ldpc_encode(&info, &LDPC_648_R56);
+        assert_eq!(codeword.len(), LDPC_648_R56.n);
+        assert!(
+            verify_codeword(&codeword, &LDPC_648_R56),
+            "Syndrome check failed for rate 5/6 codeword"
+        );
+        assert_eq!(&codeword[..LDPC_648_R56.k], &info[..]);
+    }
+
+    #[test]
+    fn test_ldpc_encode_decode_rate_five_sixths_clean() {
+        let mut info = vec![0u8; LDPC_648_R56.k];
+        for i in 0..info.len() {
+            info[i] = ((i * 7 + 5) % 2) as u8;
+        }
+        let codeword = ldpc_encode(&info, &LDPC_648_R56);
+
+        let llr: Vec<f32> = codeword.iter().map(|&b| if b == 0 { 3.0 } else { -3.0 }).collect();
+        let decoded = ldpc_decode(&llr, &LDPC_648_R56, 30);
+        assert_eq!(decoded, info, "Rate 5/6 clean decode failed");
     }
 }

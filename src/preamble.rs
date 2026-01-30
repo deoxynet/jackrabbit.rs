@@ -1,7 +1,7 @@
 /// Preamble generation (PN sequence) and detection.
 
 use num_complex::Complex32;
-use crate::params::{FFT_SIZE, PREAMBLE_SYMBOLS, PREAMBLE_SYMBOLS_SHORT, SYMBOL_TOTAL};
+use crate::params::{FFT_SIZE, CP_LEN, PREAMBLE_SYMBOLS, PREAMBLE_SYMBOLS_SHORT, PREAMBLE_SYMBOLS_MINIMAL};
 use crate::ofdm;
 
 /// Generate a PN (pseudo-noise) sequence of length `n` using an LFSR.
@@ -23,8 +23,13 @@ fn generate_pn_sequence(n: usize, seed: u32) -> Vec<f32> {
 /// PN values. This creates a time-domain signal with two identical halves
 /// per OFDM symbol (the Schmidl-Cox property).
 ///
-/// Returns preamble_symbols × SYMBOL_TOTAL samples.
+/// Returns preamble_symbols × (FFT_SIZE + cp_len) samples.
 pub fn generate_preamble_symbols(preamble_symbols: usize) -> Vec<f32> {
+    generate_preamble_symbols_with_cp(preamble_symbols, CP_LEN)
+}
+
+/// Generate preamble with a custom cyclic prefix length.
+pub fn generate_preamble_symbols_with_cp(preamble_symbols: usize, cp_len: usize) -> Vec<f32> {
     assert!(preamble_symbols > 0, "Preamble must have at least 1 symbol");
     let pn = generate_pn_sequence(FFT_SIZE / 2, 0xCAFE);
 
@@ -38,9 +43,10 @@ pub fn generate_preamble_symbols(preamble_symbols: usize) -> Vec<f32> {
     }
 
     let base_symbol = ofdm::ifft_real(&spectrum);
-    let base_with_cp = ofdm::add_cyclic_prefix(&base_symbol);
+    let base_with_cp = ofdm::add_cyclic_prefix_n(&base_symbol, cp_len);
 
-    let mut preamble = Vec::with_capacity(preamble_symbols * SYMBOL_TOTAL);
+    let sym_total = FFT_SIZE + cp_len;
+    let mut preamble = Vec::with_capacity(preamble_symbols * sym_total);
     for _ in 0..preamble_symbols {
         preamble.extend_from_slice(&base_with_cp);
     }
@@ -55,6 +61,17 @@ pub fn generate_preamble() -> Vec<f32> {
 /// Generate training symbols (known BPSK data on all active bins).
 /// Returns (waveform of 2 × SYMBOL_TOTAL samples, known symbols).
 pub fn generate_training(bin_start: usize, bin_end: usize) -> (Vec<f32>, Vec<Complex32>) {
+    generate_training_with_cp(bin_start, bin_end, CP_LEN)
+}
+
+/// Generate training symbols with a custom cyclic prefix length.
+pub fn generate_training_with_cp(bin_start: usize, bin_end: usize, cp_len: usize) -> (Vec<f32>, Vec<Complex32>) {
+    generate_training_full(bin_start, bin_end, cp_len, 2)
+}
+
+/// Generate training symbols with custom CP and symbol count (1 or 2).
+pub fn generate_training_full(bin_start: usize, bin_end: usize, cp_len: usize, n_symbols: usize) -> (Vec<f32>, Vec<Complex32>) {
+    assert!(n_symbols >= 1 && n_symbols <= 2, "Training needs 1 or 2 symbols");
     let n_carriers = bin_end - bin_start;
     let pn = generate_pn_sequence(n_carriers, 0xBEEF);
 
@@ -62,12 +79,12 @@ pub fn generate_training(bin_start: usize, bin_end: usize) -> (Vec<f32>, Vec<Com
         .map(|&p| Complex32::new(p, 0.0))
         .collect();
 
-    let sym1 = ofdm::synthesize_symbol(&known_symbols, bin_start, bin_end);
-    let sym2 = ofdm::synthesize_symbol(&known_symbols, bin_start, bin_end);
-
-    let mut waveform = Vec::with_capacity(2 * SYMBOL_TOTAL);
-    waveform.extend_from_slice(&sym1);
-    waveform.extend_from_slice(&sym2);
+    let sym_total = FFT_SIZE + cp_len;
+    let mut waveform = Vec::with_capacity(n_symbols * sym_total);
+    for _ in 0..n_symbols {
+        let sym = ofdm::synthesize_symbol_cp(&known_symbols, bin_start, bin_end, cp_len);
+        waveform.extend_from_slice(&sym);
+    }
 
     (waveform, known_symbols)
 }
@@ -87,12 +104,17 @@ pub fn training_reference(bin_start: usize, bin_end: usize) -> Vec<Complex32> {
 ///
 /// Returns estimated CFO in Hz.
 pub fn estimate_cfo(preamble_samples: &[f32]) -> f32 {
+    estimate_cfo_with_cp(preamble_samples, CP_LEN)
+}
+
+/// Estimate CFO with a custom cyclic prefix length.
+pub fn estimate_cfo_with_cp(preamble_samples: &[f32], cp_len: usize) -> f32 {
     use rustfft::FftPlanner;
     use num_complex::Complex32;
     use std::f32::consts::PI;
 
     let lag = FFT_SIZE / 2; // 480
-    let symbol_len = crate::params::SYMBOL_TOTAL;
+    let symbol_len = FFT_SIZE + cp_len;
     if preamble_samples.len() < symbol_len {
         return 0.0;
     }
@@ -109,7 +131,7 @@ pub fn estimate_cfo(preamble_samples: &[f32]) -> f32 {
     let mut p = Complex32::new(0.0, 0.0);
 
     for sym_idx in 0..n_symbols {
-        let start = sym_idx * symbol_len + crate::params::CP_LEN;
+        let start = sym_idx * symbol_len + cp_len;
         if start + FFT_SIZE > preamble_samples.len() {
             break;
         }
@@ -219,6 +241,7 @@ pub fn correct_cfo(samples: &[f32], delta_f_hz: f32) -> Vec<f32> {
 pub struct PreambleDetector {
     detected: bool,
     preamble_symbols: usize,
+    overhead_cp: usize,
 }
 
 impl PreambleDetector {
@@ -226,7 +249,12 @@ impl PreambleDetector {
         PreambleDetector {
             detected: false,
             preamble_symbols: 0,
+            overhead_cp: CP_LEN,
         }
+    }
+
+    pub fn set_overhead_cp(&mut self, cp_len: usize) {
+        self.overhead_cp = cp_len;
     }
 
     pub fn reset(&mut self) {
@@ -247,9 +275,12 @@ impl PreambleDetector {
         }
 
         let half = FFT_SIZE / 2; // 480 — the half-symbol lag
-        let preamble_len_long = PREAMBLE_SYMBOLS * SYMBOL_TOTAL;
-        let preamble_len_short = PREAMBLE_SYMBOLS_SHORT * SYMBOL_TOTAL;
-        let min_len = preamble_len_short + SYMBOL_TOTAL;
+        let sym_total = FFT_SIZE + self.overhead_cp;
+        let preamble_len_long = PREAMBLE_SYMBOLS * sym_total;
+        let preamble_len_short = PREAMBLE_SYMBOLS_SHORT * sym_total;
+        let preamble_len_minimal = PREAMBLE_SYMBOLS_MINIMAL * sym_total;
+        // Need at least: smallest preamble + half-window for SC metric check after it
+        let min_len = preamble_len_minimal + 2 * half;
         if samples.len() < min_len || samples.len() < 2 * half {
             return None;
         }
@@ -377,43 +408,65 @@ impl PreambleDetector {
 
         let start = fine_start;
 
-        // Determine short vs long preamble by checking if the signal at
-        // short_end still has the preamble's half-symbol repetition.
+        // Determine preamble length (2, 4, or 8 symbols) by checking if the
+        // signal at each boundary still has the preamble's half-symbol repetition.
         // Uses the same Schmidl-Cox metric as detection — works at any
         // alignment within the preamble (robust to timing offsets < CP_LEN).
-        let short_end = start + preamble_len_short;
-        if short_end + 2 * half > samples.len() {
-            return None;
-        }
-
-        let mut p_c: f64 = 0.0;
-        let mut r1_c: f64 = 0.0;
-        let mut r2_c: f64 = 0.0;
-        for n in 0..half {
-            let x0 = samples[short_end + n] as f64;
-            let x1 = samples[short_end + n + half] as f64;
-            p_c += x0 * x1;
-            r1_c += x0 * x0;
-            r2_c += x1 * x1;
-        }
-        let m_check = if r1_c * r2_c > 1e-20 { (p_c * p_c) / (r1_c * r2_c) } else { 0.0 };
-        let use_long = if m_check > 0.3 {
-            if start + preamble_len_long > samples.len() {
+        //
+        // Check boundaries from shortest to longest: if the metric drops below
+        // threshold at a boundary, the preamble ended before that point.
+        let sc_check = |boundary: usize| -> Option<f64> {
+            if boundary + 2 * half > samples.len() {
                 return None;
             }
-            true
-        } else {
-            false
+            let mut p_c: f64 = 0.0;
+            let mut r1_c: f64 = 0.0;
+            let mut r2_c: f64 = 0.0;
+            for n in 0..half {
+                let x0 = samples[boundary + n] as f64;
+                let x1 = samples[boundary + n + half] as f64;
+                p_c += x0 * x1;
+                r1_c += x0 * x0;
+                r2_c += x1 * x1;
+            }
+            Some(if r1_c * r2_c > 1e-20 { (p_c * p_c) / (r1_c * r2_c) } else { 0.0 })
         };
 
-        let preamble_len = if use_long { preamble_len_long } else { preamble_len_short };
+        // Check at 2-symbol boundary
+        let minimal_end = start + preamble_len_minimal;
+        let m_minimal = match sc_check(minimal_end) {
+            Some(m) => m,
+            None => return None,
+        };
+
+        let preamble_len = if m_minimal <= 0.3 {
+            // No repetition at 2-symbol boundary → minimal preamble (2 symbols)
+            preamble_len_minimal
+        } else {
+            // Still repeating at 2 symbols — check at 4-symbol boundary
+            let short_end = start + preamble_len_short;
+            let m_short = match sc_check(short_end) {
+                Some(m) => m,
+                None => return None,
+            };
+            if m_short <= 0.3 {
+                // Stopped at 4 symbols → short preamble
+                preamble_len_short
+            } else {
+                // Still repeating at 4 symbols → long preamble (8 symbols)
+                if start + preamble_len_long > samples.len() {
+                    return None;
+                }
+                preamble_len_long
+            }
+        };
         let preamble_end = start + preamble_len;
         if preamble_end > samples.len() {
             return None;
         }
 
         self.detected = true;
-        self.preamble_symbols = preamble_len / SYMBOL_TOTAL;
+        self.preamble_symbols = preamble_len / sym_total;
         Some(preamble_end)
     }
 
@@ -426,13 +479,14 @@ impl PreambleDetector {
     }
 
     pub fn preamble_len_samples(&self) -> usize {
-        self.preamble_symbols * SYMBOL_TOTAL
+        self.preamble_symbols * (FFT_SIZE + self.overhead_cp)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::params::SYMBOL_TOTAL;
 
     #[test]
     fn test_preamble_generation() {
@@ -522,5 +576,26 @@ mod tests {
         assert!(result.is_some(), "Should detect short preamble");
         assert_eq!(result.unwrap(), PREAMBLE_SYMBOLS_SHORT * SYMBOL_TOTAL);
         assert_eq!(detector.preamble_symbols(), PREAMBLE_SYMBOLS_SHORT);
+    }
+
+    #[test]
+    fn test_preamble_generation_minimal() {
+        let preamble = generate_preamble_symbols(PREAMBLE_SYMBOLS_MINIMAL);
+        assert_eq!(preamble.len(), PREAMBLE_SYMBOLS_MINIMAL * SYMBOL_TOTAL);
+    }
+
+    #[test]
+    fn test_preamble_detection_minimal() {
+        let preamble = generate_preamble_symbols(PREAMBLE_SYMBOLS_MINIMAL);
+        let (training, _) = generate_training(20, 80);
+        let mut waveform = Vec::new();
+        waveform.extend_from_slice(&preamble);
+        waveform.extend_from_slice(&training);
+
+        let mut detector = PreambleDetector::new();
+        let result = detector.feed(&waveform);
+        assert!(result.is_some(), "Should detect minimal (2-symbol) preamble");
+        assert_eq!(result.unwrap(), PREAMBLE_SYMBOLS_MINIMAL * SYMBOL_TOTAL);
+        assert_eq!(detector.preamble_symbols(), PREAMBLE_SYMBOLS_MINIMAL);
     }
 }

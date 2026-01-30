@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use crate::decoder::Decoder;
 use crate::encoder;
-use crate::params::{SAMPLE_RATE, PROTOCOLS};
+use crate::params::{self, SAMPLE_RATE, PROTOCOLS};
 
 struct Instance {
     decoder: Decoder,
@@ -65,14 +65,23 @@ pub async fn ggwave_factory() -> Result<JsValue, JsValue> {
     Reflect::set(&module, &"init".into(), init_fn.as_ref())?;
     init_fn.forget();
 
-    // encode(handle, Uint8Array, protocolId, volume) → Int8Array
-    let encode_fn = Closure::wrap(Box::new(|_handle: u32, data: Uint8Array, protocol_id: u32, volume: f32| -> Int8Array {
+    // encode(handle, Uint8Array, protocolId, volume, preambleSymbols?, overheadCp?) → Int8Array
+    // preambleSymbols: 0 or omitted = default (8), 4 = short, 2 = minimal
+    // overheadCp: 0 or omitted = default CP (240), otherwise specific CP length
+    let encode_fn = Closure::wrap(Box::new(|_handle: u32, data: Uint8Array, protocol_id: u32, volume: f32, preamble_symbols: u32, overhead_cp: u32, training_symbols: u32| -> Int8Array {
         let payload = data.to_vec();
-        if payload.is_empty() || payload.len() > 1023 || protocol_id >= PROTOCOLS.len() as u32 {
+        if payload.is_empty() || payload.len() > params::MAX_PAYLOAD || protocol_id >= PROTOCOLS.len() as u32 {
             return Int8Array::new_with_length(0);
         }
 
-        let waveform = encoder::encode(&payload, protocol_id as u8, volume);
+        let preamble_len = match preamble_symbols {
+            2 => params::PREAMBLE_SYMBOLS_MINIMAL,
+            4 => params::PREAMBLE_SYMBOLS_SHORT,
+            _ => params::PREAMBLE_SYMBOLS,
+        };
+        let overhead_cp_len = if overhead_cp > 0 { overhead_cp as usize } else { params::CP_LEN };
+        let training = if training_symbols >= 1 && training_symbols <= 2 { training_symbols as usize } else { params::TRAINING_SYMBOLS };
+        let waveform = encoder::encode_max(&payload, protocol_id as u8, volume, preamble_len, overhead_cp_len, training);
 
         // Convert f32 samples to byte view (Int8Array over the same f32 data)
         let byte_len = waveform.len() * 4;
@@ -89,7 +98,7 @@ pub async fn ggwave_factory() -> Result<JsValue, JsValue> {
         let u8_array = Uint8Array::new_with_length(byte_len as u32);
         u8_array.copy_from(bytes);
         Int8Array::new(&u8_array.buffer())
-    }) as Box<dyn Fn(u32, Uint8Array, u32, f32) -> Int8Array>);
+    }) as Box<dyn Fn(u32, Uint8Array, u32, f32, u32, u32, u32) -> Int8Array>);
     Reflect::set(&module, &"encode".into(), encode_fn.as_ref())?;
     encode_fn.forget();
 
@@ -135,6 +144,31 @@ pub async fn ggwave_factory() -> Result<JsValue, JsValue> {
     }) as Box<dyn Fn(u32, Int8Array) -> Uint8Array>);
     Reflect::set(&module, &"decode".into(), decode_fn.as_ref())?;
     decode_fn.forget();
+
+    // setOverheadCp(handle, cpLen) — set overhead CP for decoder (preamble/training/header)
+    let set_overhead_cp_fn = Closure::wrap(Box::new(|handle: u32, cp_len: u32| {
+        INSTANCES.with(|instances| {
+            let mut map = instances.borrow_mut();
+            if let Some(instance) = map.get_mut(&handle) {
+                instance.decoder.set_overhead_cp(cp_len as usize);
+            }
+        });
+    }) as Box<dyn Fn(u32, u32)>);
+    Reflect::set(&module, &"setOverheadCp".into(), set_overhead_cp_fn.as_ref())?;
+    set_overhead_cp_fn.forget();
+
+    // setTrainingSymbols(handle, count) — set training symbol count for decoder (1 or 2)
+    let set_training_symbols_fn = Closure::wrap(Box::new(|handle: u32, count: u32| {
+        INSTANCES.with(|instances| {
+            let mut map = instances.borrow_mut();
+            if let Some(instance) = map.get_mut(&handle) {
+                let n = if count >= 1 && count <= 2 { count as usize } else { params::TRAINING_SYMBOLS };
+                instance.decoder.set_training_symbols(n);
+            }
+        });
+    }) as Box<dyn Fn(u32, u32)>);
+    Reflect::set(&module, &"setTrainingSymbols".into(), set_training_symbols_fn.as_ref())?;
+    set_training_symbols_fn.forget();
 
     // debugInfo(handle) → { state, bufferLen, totalSamples, maxAmplitude, rmsAmplitude }
     let debug_fn = Closure::wrap(Box::new(|handle: u32| -> JsValue {
@@ -185,6 +219,7 @@ pub async fn ggwave_factory() -> Result<JsValue, JsValue> {
     Reflect::set(&protocol_id, &"GGWAVE_PROTOCOL_WIRED_TURBO".into(), &JsValue::from(13))?;
     Reflect::set(&protocol_id, &"GGWAVE_PROTOCOL_WIRED_MAX".into(), &JsValue::from(14))?;
     Reflect::set(&protocol_id, &"GGWAVE_PROTOCOL_OTA_ROBUST".into(), &JsValue::from(15))?;
+    Reflect::set(&protocol_id, &"GGWAVE_PROTOCOL_WIRED_EXTREME".into(), &JsValue::from(16))?;
     Reflect::set(&module, &"ProtocolId".into(), &protocol_id)?;
 
     // SampleFormat
