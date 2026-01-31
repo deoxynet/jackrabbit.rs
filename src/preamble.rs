@@ -383,8 +383,16 @@ impl PreambleDetector {
             }
         }
 
-        // Pass 2: find first position where M reaches 90% of peak
+        // Pass 2: find first position where M reaches 90% of peak.
+        // Energy gate: require window-1 energy ≈ window-2 energy, which
+        // rejects positions where window-1 straddles a zero-gap / signal
+        // boundary (timing error).  Threshold adapts to CP size: tight
+        // for small CP (wired, CP=30) to keep error well within the CP,
+        // loose for large CP (OTA, CP=240) so reverb-induced energy
+        // imbalance doesn't prevent detection.
         let rising_threshold = fine_peak_m * 0.9;
+        let max_err = self.overhead_cp.saturating_sub(10);
+        let energy_gate = (1.0 - max_err as f64 / half as f64).max(0.5);
         let mut fine_start = coarse_start;
         for d in coarse_start..search_end {
             if d + 2 * half > samples.len() { break; }
@@ -400,7 +408,7 @@ impl PreambleDetector {
             }
             let denom = r1f * r2f;
             let mf = if denom > 1e-20 { (pf * pf) / denom } else { 0.0 };
-            if mf >= rising_threshold {
+            if mf >= rising_threshold && r1f > energy_gate * r2f {
                 fine_start = d;
                 break;
             }

@@ -2,7 +2,7 @@
 
 use crate::crc;
 use crate::fec;
-use crate::header;
+use crate::header::{self, HeaderInfo, FrameType};
 use crate::interleaver;
 use crate::ldpc;
 use crate::modulation;
@@ -51,8 +51,39 @@ pub fn encode_max(
     overhead_cp_len: usize,
     training_symbols: usize,
 ) -> Vec<f32> {
-    assert!(!payload.is_empty(), "Payload must not be empty");
-    assert!(payload.len() <= params::MAX_PAYLOAD, "Payload too large");
+    let header_info = HeaderInfo {
+        frame_type: FrameType::Data,
+        seq_num: 0,
+        protocol_id,
+        payload_len: payload.len(),
+    };
+    encode_inner(payload, &header_info, volume, preamble_symbols, overhead_cp_len, training_symbols)
+}
+
+/// Encode with explicit header metadata (frame type, sequence number, etc).
+pub fn encode_with_header(
+    payload: &[u8],
+    header_info: &HeaderInfo,
+    volume: f32,
+    preamble_symbols: usize,
+    overhead_cp_len: usize,
+    training_symbols: usize,
+) -> Vec<f32> {
+    encode_inner(payload, header_info, volume, preamble_symbols, overhead_cp_len, training_symbols)
+}
+
+fn encode_inner(
+    payload: &[u8],
+    header_info: &HeaderInfo,
+    volume: f32,
+    preamble_symbols: usize,
+    overhead_cp_len: usize,
+    training_symbols: usize,
+) -> Vec<f32> {
+    if payload.is_empty() || payload.len() > params::MAX_PAYLOAD {
+        return Vec::new();
+    }
+    let protocol_id = header_info.protocol_id;
     if protocol_id as usize >= params::PROTOCOLS.len() {
         return Vec::new();
     }
@@ -105,7 +136,7 @@ pub fn encode_max(
     );
 
     // 8. Generate header symbol (using overhead CP)
-    let header_waveform = header::encode_header_symbol_with_cp(protocol_id, payload.len(), overhead_cp_len);
+    let header_waveform = header::encode_header_symbol_with_cp(header_info, overhead_cp_len);
 
     // 9. Generate data symbols (using per-protocol CP length)
     let data_sym_total = config.symbol_total();

@@ -6,9 +6,16 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "jackrabbit"
+path = "src/bin/jackrabbit.rs"
+required-features = ["cli"]
+
 [dependencies]
 rustfft = "6.2"
 num-complex = "0.4"
+cpal = { version = "0.15", optional = true }
+libc = { version = "0.2", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
@@ -16,6 +23,7 @@ js-sys = { version = "0.3", optional = true }
 [features]
 default = []
 wasm = ["wasm-bindgen", "wasm-bindgen-futures", "js-sys"]
+cli = ["dep:cpal", "dep:libc"]
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
@@ -24,3 +32,10 @@ cpal = "0.15"
 [profile.release]
 opt-level = 3
 lto = true
+
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+strip = true

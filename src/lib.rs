@@ -11,6 +11,9 @@ pub mod channel;
 pub mod header;
 pub mod encoder;
 pub mod decoder;
+pub mod phy;
+pub mod arq;
+pub mod mac;
 pub mod adaptive;
 pub mod impairments;
 

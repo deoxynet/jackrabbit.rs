@@ -26,9 +26,10 @@ pub const TRAINING_SAMPLES: usize = TRAINING_SYMBOLS * SYMBOL_TOTAL; // 2400 (50
 pub const HEADER_SYMBOLS: usize = 1;
 pub const HEADER_BINS_START: usize = 20;
 pub const HEADER_BINS_END: usize = 80; // bins 20–79 (60 carriers)
-pub const HEADER_INFO_BITS: usize = 18; // 5-bit proto + 12-bit length + 1-bit parity
+pub const HEADER_INFO_BITS: usize = 24; // 3-bit frame_type + 4-bit seq_num + 5-bit proto + 12-bit length
 pub const MAX_PAYLOAD: usize = 4095;
 pub const RING_BUFFER_SIZE: usize = 131072; // 2^17, ~2.7s at 48kHz
+pub const DEFAULT_TARGET_FRAME_MS: u32 = 400;
 
 /// Spacing between pilot subcarriers (in bins).
 pub const PILOT_SPACING: usize = 10;
@@ -257,11 +258,63 @@ pub static PROTOCOLS: [ProtocolConfig; 17] = [
 ];
 
 pub fn get_protocol(id: u8) -> &'static ProtocolConfig {
-    &PROTOCOLS[id as usize]
+    PROTOCOLS
+        .get(id as usize)
+        .unwrap_or_else(|| panic!("invalid protocol id {}", id))
+}
+
+/// Recommend a maximum payload size that keeps one-way frame duration under target_ms.
+pub fn recommended_mtu(protocol_id: u8, wired: bool, target_ms: u32) -> usize {
+    let config = get_protocol(protocol_id);
+    let preamble_symbols = if wired { PREAMBLE_SYMBOLS_MINIMAL } else { PREAMBLE_SYMBOLS };
+    let training_symbols = if wired { TRAINING_SYMBOLS_SHORT } else { TRAINING_SYMBOLS };
+    let overhead_cp = if wired { config.cp_len } else { CP_LEN };
+    let target_samples = (SAMPLE_RATE as u64 * target_ms as u64 / 1000) as usize;
+
+    let mut lo = 1usize;
+    let mut hi = MAX_PAYLOAD;
+    let mut best = 1usize;
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let samples = config.total_samples_for_max(
+            mid,
+            preamble_symbols,
+            overhead_cp,
+            training_symbols,
+        );
+        if samples <= target_samples {
+            best = mid;
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best.min(MAX_PAYLOAD).max(1)
 }
 
 /// Generate the known pilot symbol values for a given number of pilots.
 /// Uses BPSK +1 for all pilots (known reference).
+/// Frame duration in milliseconds for a given protocol, payload, and link mode.
+pub fn frame_duration_ms(protocol_id: u8, payload_len: usize, wired: bool) -> f64 {
+    let config = get_protocol(protocol_id);
+    let preamble = if wired { PREAMBLE_SYMBOLS_MINIMAL } else { PREAMBLE_SYMBOLS };
+    let training = if wired { TRAINING_SYMBOLS_SHORT } else { TRAINING_SYMBOLS };
+    let overhead_cp = if wired { config.cp_len } else { CP_LEN };
+    let samples = config.total_samples_for_max(payload_len, preamble, overhead_cp, training);
+    samples as f64 / SAMPLE_RATE as f64 * 1000.0
+}
+
+/// Frame duration in samples.
+pub fn frame_samples(protocol_id: u8, payload_len: usize, wired: bool) -> usize {
+    let config = get_protocol(protocol_id);
+    let preamble = if wired { PREAMBLE_SYMBOLS_MINIMAL } else { PREAMBLE_SYMBOLS };
+    let training = if wired { TRAINING_SYMBOLS_SHORT } else { TRAINING_SYMBOLS };
+    let overhead_cp = if wired { config.cp_len } else { CP_LEN };
+    config.total_samples_for_max(payload_len, preamble, overhead_cp, training)
+}
+
 pub fn pilot_symbols(n: usize) -> Vec<Complex32> {
     vec![Complex32::new(1.0, 0.0); n]
 }

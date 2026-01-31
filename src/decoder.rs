@@ -14,12 +14,12 @@ use crate::channel;
 use crate::crc;
 use crate::encoder;
 use crate::fec;
-use crate::header;
+use crate::header::{self, HeaderInfo};
 use crate::interleaver;
 use crate::ldpc;
 use crate::modulation;
 use crate::ofdm;
-use crate::params::{self, ProtocolConfig, SYMBOL_TOTAL, TRAINING_SYMBOLS};
+use crate::params::{self, ProtocolConfig};
 use crate::preamble;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -65,6 +65,7 @@ pub struct Decoder {
     protocol_config: Option<&'static ProtocolConfig>,
 
     // After header
+    header_info: Option<HeaderInfo>,
     payload_len: usize,
     n_data_symbols: usize,
 
@@ -113,6 +114,7 @@ impl Decoder {
             integer_cfo_bins: 0,
             channel_estimate: Vec::new(),
             protocol_config: None,
+            header_info: None,
             payload_len: 0,
             n_data_symbols: 0,
             phase_delta: 0.0,
@@ -191,6 +193,7 @@ impl Decoder {
         self.integer_cfo_bins = 0;
         self.channel_estimate.clear();
         self.protocol_config = None;
+        self.header_info = None;
         self.payload_len = 0;
         self.n_data_symbols = 0;
         self.phase_delta = 0.0;
@@ -246,6 +249,14 @@ impl Decoder {
     /// Feed samples to the decoder. Returns decoded payload bytes if a complete
     /// packet is successfully decoded, or empty vec if still waiting for more data.
     pub fn feed(&mut self, samples: &[f32]) -> Vec<u8> {
+        self.feed_frame(samples)
+            .map(|(_, payload)| payload)
+            .unwrap_or_default()
+    }
+
+    /// Feed samples to the decoder. Returns (HeaderInfo, payload) on successful
+    /// decode, or None if still waiting for more data.
+    pub fn feed_frame(&mut self, samples: &[f32]) -> Option<(HeaderInfo, Vec<u8>)> {
         // Track diagnostics
         self.total_samples_fed += samples.len() as u64;
         for &s in samples {
@@ -281,7 +292,7 @@ impl Decoder {
         self.process()
     }
 
-    fn process(&mut self) -> Vec<u8> {
+    fn process(&mut self) -> Option<(HeaderInfo, Vec<u8>)> {
         // Timeout: if the buffer has grown far beyond what any valid signal
         // needs while in a non-Idle state, we're stuck (corrupted header
         // claiming too many data symbols, or other pathological case).
@@ -337,19 +348,19 @@ impl Decoder {
                         self.read_pos = offset;
                         self.state = State::CollectTraining;
                     } else {
-                        return Vec::new();
+                        return None;
                     }
                 }
                 State::CollectTraining => {
                     if self.available() < self.training_symbols * self.overhead_sym_total() {
-                        return Vec::new();
+                        return None;
                     }
                     self.process_training();
                     self.state = State::CollectHeader;
                 }
                 State::CollectHeader => {
                     if self.available() < self.overhead_sym_total() {
-                        return Vec::new();
+                        return None;
                     }
                     if !self.process_header() {
                         self.last_event = "header_fail";
@@ -357,7 +368,7 @@ impl Decoder {
                         if retries >= MAX_RETRIES {
                             // Too many false detections — give up and wait
                             // for the next feed() call with fresh samples.
-                            return Vec::new();
+                            return None;
                         }
                         // Preserve unprocessed samples so the real preamble
                         // (if present later in the buffer) can still be found.
@@ -525,11 +536,12 @@ impl Decoder {
         let phase_comp = Complex32::new((-header_phase).cos(), (-header_phase).sin());
         let corrected: Vec<Complex32> = equalized.iter().map(|&e| e * phase_comp).collect();
 
-        if let Some((proto_id, payload_len)) = header::decode_header(&corrected) {
-            let config = params::get_protocol(proto_id);
+        if let Some(info) = header::decode_header(&corrected) {
+            let config = params::get_protocol(info.protocol_id);
             self.protocol_config = Some(config);
-            self.payload_len = payload_len;
-            self.n_data_symbols = config.data_symbols_for(payload_len);
+            self.header_info = Some(info);
+            self.payload_len = info.payload_len;
+            self.n_data_symbols = config.data_symbols_for(info.payload_len);
             self.data_soft_bits.clear();
             self.data_symbols_collected = 0;
             true
@@ -538,7 +550,7 @@ impl Decoder {
         }
     }
 
-    fn process_data(&mut self) -> Vec<u8> {
+    fn process_data(&mut self) -> Option<(HeaderInfo, Vec<u8>)> {
         let config = self.protocol_config.unwrap();
         let adj_start = (config.bin_start as i32 + self.integer_cfo_bins) as usize;
         let adj_end = (config.bin_end as i32 + self.integer_cfo_bins) as usize;
@@ -553,7 +565,7 @@ impl Decoder {
 
         while self.data_symbols_collected < self.n_data_symbols {
             if self.available() < data_sym_total {
-                return Vec::new();
+                return None;
             }
 
             let sym = self.read_samples(data_sym_total).to_vec();
@@ -659,7 +671,9 @@ impl Decoder {
 
         let decoded_bytes = encoder::bits_to_bytes(&decoded_bits);
 
-        let result = match crc::check_crc(&decoded_bytes) {
+        let header_info = self.header_info.unwrap();
+
+        match crc::check_crc(&decoded_bytes) {
             Some(payload) => {
                 self.last_event = "crc_ok";
                 // Compute channel quality report on successful decode
@@ -678,20 +692,18 @@ impl Decoder {
                     trained_bin_start,
                     trained_bin_end,
                 ));
-                payload
+                // Successful decode — reset state but preserve any trailing samples.
+                self.reset_for_retry();
+                Some((header_info, payload))
             }
             None => {
                 self.last_event = "crc_fail";
                 // Preserve remaining buffer for retry (another preamble
                 // might be present if this was a false/corrupted detection).
                 self.reset_for_retry();
-                return Vec::new();
+                None
             }
-        };
-
-        // Successful decode — full reset (buffer no longer needed).
-        self.reset();
-        result
+        }
     }
 
     /// Per-symbol pilot-based channel correction.
@@ -785,7 +797,7 @@ impl Decoder {
 mod tests {
     use super::*;
     use crate::encoder;
-    use crate::params::SYMBOL_TOTAL;
+    use crate::params::{SYMBOL_TOTAL, TRAINING_SYMBOLS};
 
     #[test]
     fn test_decode_encoded_signal() {
@@ -829,6 +841,26 @@ mod tests {
         }
 
         assert_eq!(result, payload, "Chunked decode failed");
+    }
+
+    #[test]
+    fn test_decode_two_frames_single_buffer() {
+        let payload1 = b"frame one";
+        let payload2 = b"frame two";
+        let waveform1 = encoder::encode(payload1, 0, 1.0);
+        let waveform2 = encoder::encode(payload2, 0, 1.0);
+
+        let mut signal = Vec::new();
+        signal.extend_from_slice(&waveform1);
+        signal.extend_from_slice(&vec![0.0f32; 4800]);
+        signal.extend_from_slice(&waveform2);
+
+        let mut decoder = Decoder::new();
+        let (_info1, out1) = decoder.feed_frame(&signal).expect("first frame decode failed");
+        assert_eq!(out1, payload1);
+
+        let (_info2, out2) = decoder.feed_frame(&[]).expect("second frame decode failed");
+        assert_eq!(out2, payload2);
     }
 
     #[test]

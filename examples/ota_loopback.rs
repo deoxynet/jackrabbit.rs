@@ -27,6 +27,7 @@ fn main() {
     let mut input_device_name: Option<String> = None;
     let mut output_device_name: Option<String> = None;
 
+
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -55,6 +56,7 @@ fn main() {
                     }
                 }
             }
+
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 eprintln!("Usage: ota_loopback [--protocol N] [--payload \"text\"] [--listen [secs]] [--input-device <name>] [--output-device <name>]");
@@ -74,6 +76,8 @@ fn main() {
     let waveform_secs = waveform.len() as f64 / TARGET_SAMPLE_RATE as f64;
     eprintln!("Encoded: {} samples ({:.2}s)", waveform.len(), waveform_secs);
 
+
+
     // In listen mode, loop the signal for the requested duration so the user
     // can hear what the OFDM waveform sounds like. No recording/decoding.
     if listen_mode {
@@ -89,6 +93,8 @@ fn main() {
         play_only(&play_buf, listen_secs);
         return;
     }
+
+    // --- Hardware OTA mode ---
 
     // Prepend 0.5s silence, append 1.0s silence
     let pre_silence = vec![0.0f32; (TARGET_SAMPLE_RATE / 2) as usize];
