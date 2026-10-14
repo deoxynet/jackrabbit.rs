@@ -219,7 +219,6 @@ pub async fn ggwave_factory() -> Result<JsValue, JsValue> {
     Reflect::set(&protocol_id, &"GGWAVE_PROTOCOL_WIRED_TURBO".into(), &JsValue::from(13))?;
     Reflect::set(&protocol_id, &"GGWAVE_PROTOCOL_WIRED_MAX".into(), &JsValue::from(14))?;
     Reflect::set(&protocol_id, &"GGWAVE_PROTOCOL_OTA_ROBUST".into(), &JsValue::from(15))?;
-    Reflect::set(&protocol_id, &"GGWAVE_PROTOCOL_WIRED_EXTREME".into(), &JsValue::from(16))?;
     Reflect::set(&module, &"ProtocolId".into(), &protocol_id)?;
 
     // SampleFormat

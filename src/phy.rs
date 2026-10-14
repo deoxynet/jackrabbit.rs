@@ -3,7 +3,7 @@
 use crate::decoder::Decoder;
 use crate::encoder;
 use crate::header::{FrameType, HeaderInfo};
-use crate::params;
+use crate::params::{self, BitloadProfile};
 use crate::adaptive::ChannelReport;
 
 /// A PHY-layer frame with metadata and payload.
@@ -82,6 +82,68 @@ impl PhyFrame {
             preamble_symbols,
             overhead_cp_len,
             training_symbols,
+        )
+    }
+
+    /// Encode with all configurable parameters and an optional data CP override.
+    pub fn encode_full_with_data_cp(
+        &self,
+        volume: f32,
+        preamble_symbols: usize,
+        overhead_cp_len: usize,
+        training_symbols: usize,
+        data_cp_len: Option<usize>,
+    ) -> Vec<f32> {
+        encoder::encode_with_header_data_cp(
+            &self.payload,
+            &self.header_info(),
+            volume,
+            preamble_symbols,
+            overhead_cp_len,
+            training_symbols,
+            data_cp_len,
+        )
+    }
+
+    /// Encode with a bitloading profile for per-band modulation.
+    pub fn encode_bitloaded(
+        &self,
+        volume: f32,
+        preamble_symbols: usize,
+        overhead_cp_len: usize,
+        training_symbols: usize,
+        profile: &BitloadProfile,
+    ) -> Vec<f32> {
+        encoder::encode_bitloaded(
+            &self.payload,
+            &self.header_info(),
+            volume,
+            preamble_symbols,
+            overhead_cp_len,
+            training_symbols,
+            profile,
+        )
+    }
+
+    /// Encode with a bitloading profile and an optional data CP override.
+    pub fn encode_bitloaded_with_data_cp(
+        &self,
+        volume: f32,
+        preamble_symbols: usize,
+        overhead_cp_len: usize,
+        training_symbols: usize,
+        data_cp_len: Option<usize>,
+        profile: &BitloadProfile,
+    ) -> Vec<f32> {
+        encoder::encode_bitloaded_with_data_cp(
+            &self.payload,
+            &self.header_info(),
+            volume,
+            preamble_symbols,
+            overhead_cp_len,
+            training_symbols,
+            data_cp_len,
+            profile,
         )
     }
 }

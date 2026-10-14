@@ -1,3 +1,5 @@
+#[macro_use]
+pub mod fft;
 pub mod params;
 pub mod crc;
 pub mod ringbuf;

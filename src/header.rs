@@ -135,7 +135,10 @@ pub fn decode_header(received_bins: &[Complex32]) -> Option<HeaderInfo> {
         payload_len |= (decoded[12 + i] as usize) << (11 - i);
     }
 
-    if proto_id as usize >= crate::params::PROTOCOLS.len() || payload_len > crate::params::MAX_PAYLOAD {
+    // Accept both standard protocol IDs (0..PROTOCOLS.len()) and bitloaded
+    // variants (BITLOAD_PROTO_BASE .. BITLOAD_PROTO_BASE + PROTOCOLS.len()).
+    let base = crate::params::base_protocol_id(proto_id);
+    if base as usize >= crate::params::PROTOCOLS.len() || payload_len > crate::params::MAX_PAYLOAD {
         return None;
     }
 

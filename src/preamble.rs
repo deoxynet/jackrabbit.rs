@@ -109,7 +109,7 @@ pub fn estimate_cfo(preamble_samples: &[f32]) -> f32 {
 
 /// Estimate CFO with a custom cyclic prefix length.
 pub fn estimate_cfo_with_cp(preamble_samples: &[f32], cp_len: usize) -> f32 {
-    use rustfft::FftPlanner;
+    use crate::fft::FftPlanner;
     use num_complex::Complex32;
     use std::f32::consts::PI;
 
@@ -176,7 +176,7 @@ pub fn estimate_cfo_with_cp(preamble_samples: &[f32], cp_len: usize) -> f32 {
 ///
 /// Returns (corrected_samples, end_phase_radians).
 pub fn correct_cfo_with_phase(samples: &[f32], delta_f_hz: f32, start_phase: f32) -> (Vec<f32>, f32) {
-    use rustfft::FftPlanner;
+    use crate::fft::FftPlanner;
     use num_complex::Complex32;
     use std::f32::consts::PI;
 

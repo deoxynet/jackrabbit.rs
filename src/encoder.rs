@@ -72,6 +72,48 @@ pub fn encode_with_header(
     encode_inner(payload, header_info, volume, preamble_symbols, overhead_cp_len, training_symbols)
 }
 
+/// Encode with explicit header metadata and an optional data CP override.
+pub fn encode_with_header_data_cp(
+    payload: &[u8],
+    header_info: &HeaderInfo,
+    volume: f32,
+    preamble_symbols: usize,
+    overhead_cp_len: usize,
+    training_symbols: usize,
+    data_cp_len: Option<usize>,
+) -> Vec<f32> {
+    encode_inner_bitloaded(
+        payload,
+        header_info,
+        volume,
+        preamble_symbols,
+        overhead_cp_len,
+        training_symbols,
+        data_cp_len,
+        None,
+    )
+}
+
+/// Encode with a bitloading profile for per-band modulation.
+///
+/// When `profile` is None or uniform, behaves identically to `encode_max`.
+/// When `profile` specifies varying modulation per band, each band's data
+/// carriers use that band's QAM order.
+pub fn encode_bitloaded(
+    payload: &[u8],
+    header_info: &HeaderInfo,
+    volume: f32,
+    preamble_symbols: usize,
+    overhead_cp_len: usize,
+    training_symbols: usize,
+    profile: &params::BitloadProfile,
+) -> Vec<f32> {
+    encode_inner_bitloaded(
+        payload, header_info, volume, preamble_symbols,
+        overhead_cp_len, training_symbols, None, Some(profile),
+    )
+}
+
 fn encode_inner(
     payload: &[u8],
     header_info: &HeaderInfo,
@@ -79,6 +121,45 @@ fn encode_inner(
     preamble_symbols: usize,
     overhead_cp_len: usize,
     training_symbols: usize,
+) -> Vec<f32> {
+    encode_inner_bitloaded(
+        payload, header_info, volume, preamble_symbols,
+        overhead_cp_len, training_symbols, None, None,
+    )
+}
+
+/// Encode with a bitloading profile and an optional data CP override.
+pub fn encode_bitloaded_with_data_cp(
+    payload: &[u8],
+    header_info: &HeaderInfo,
+    volume: f32,
+    preamble_symbols: usize,
+    overhead_cp_len: usize,
+    training_symbols: usize,
+    data_cp_len: Option<usize>,
+    profile: &params::BitloadProfile,
+) -> Vec<f32> {
+    encode_inner_bitloaded(
+        payload,
+        header_info,
+        volume,
+        preamble_symbols,
+        overhead_cp_len,
+        training_symbols,
+        data_cp_len,
+        Some(profile),
+    )
+}
+
+fn encode_inner_bitloaded(
+    payload: &[u8],
+    header_info: &HeaderInfo,
+    volume: f32,
+    preamble_symbols: usize,
+    overhead_cp_len: usize,
+    training_symbols: usize,
+    data_cp_len: Option<usize>,
+    profile: Option<&params::BitloadProfile>,
 ) -> Vec<f32> {
     if payload.is_empty() || payload.len() > params::MAX_PAYLOAD {
         return Vec::new();
@@ -116,7 +197,14 @@ fn encode_inner(
     };
 
     // 5. Partition coded bits into N symbols
-    let coded_bits_per_sym = config.coded_bits_per_symbol();
+    let num_data_carriers = config.num_data_carriers();
+    let coded_bits_per_sym = match profile {
+        Some(p) => p.coded_bits_per_symbol(num_data_carriers),
+        None => config.coded_bits_per_symbol(),
+    };
+    if coded_bits_per_sym == 0 {
+        return Vec::new();
+    }
     let n_data_symbols = (coded_bits.len() + coded_bits_per_sym - 1) / coded_bits_per_sym;
 
     // Pad coded bits to fill complete symbols
@@ -139,15 +227,22 @@ fn encode_inner(
     let header_waveform = header::encode_header_symbol_with_cp(header_info, overhead_cp_len);
 
     // 9. Generate data symbols (using per-protocol CP length)
-    let data_sym_total = config.symbol_total();
+    let data_cp_len = data_cp_len.unwrap_or(config.cp_len);
+    let data_sym_total = params::FFT_SIZE + data_cp_len;
     let mut data_waveform = Vec::with_capacity(n_data_symbols * data_sym_total);
 
     let pilot_bins = config.pilot_bins();
     let pilot_syms = params::pilot_symbols(pilot_bins.len());
-    let use_differential = config.modulation != params::Modulation::Qam16
+    // Differential encoding is used for PSK modulations (BPSK, QPSK, PSK8)
+    // where only phase carries information. QAM modulations need coherent
+    // detection (amplitude carries info). When bitloading is active, we must
+    // skip differential encoding because:
+    //   1. QAM bands would lose amplitude info (diff encode normalizes to unit circle)
+    //   2. Null bands would poison subsequent carriers (zero propagates through prev)
+    let use_differential = profile.is_none()
+        && config.modulation != params::Modulation::Qam16
         && config.modulation != params::Modulation::Qam64
-        && config.modulation != params::Modulation::Qam256
-        && config.modulation != params::Modulation::Qam1024;
+        && config.modulation != params::Modulation::Qam256;
 
     for sym_idx in 0..n_data_symbols {
         let start = sym_idx * coded_bits_per_sym;
@@ -156,18 +251,25 @@ fn encode_inner(
 
         // Per-symbol processing: interleave → modulate → insert pilots → [differential encode] → OFDM
         let interleaved = interleaver::interleave(sym_coded_bits, interleaver::symbol_seed(sym_idx));
-        let modulated = modulation::modulate(&interleaved, config.modulation);
+        let modulated = match profile {
+            Some(p) => modulation::modulate_bitloaded(&interleaved, p, num_data_carriers),
+            None => modulation::modulate(&interleaved, config.modulation),
+        };
         let full_carriers = params::merge_data_pilots(
             &modulated, &pilot_syms, &pilot_bins,
             config.bin_start, config.num_carriers(),
         );
-        // 16QAM uses coherent detection (amplitude carries info), skip differential
         let tx_carriers = if use_differential {
             modulation::differential_encode(&full_carriers)
         } else {
             full_carriers
         };
-        let symbol_samples = ofdm::synthesize_symbol_cp(&tx_carriers, config.bin_start, config.bin_end, config.cp_len);
+        let symbol_samples = ofdm::synthesize_symbol_cp(
+            &tx_carriers,
+            config.bin_start,
+            config.bin_end,
+            data_cp_len,
+        );
         data_waveform.extend_from_slice(&symbol_samples);
     }
 

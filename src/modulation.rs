@@ -3,7 +3,7 @@
 use num_complex::Complex32;
 use std::f32::consts::PI;
 
-use crate::params::Modulation;
+use crate::params::{Modulation, BitloadProfile};
 
 /// Modulate bits into complex symbols.
 pub fn modulate(bits: &[u8], modulation: Modulation) -> Vec<Complex32> {
@@ -14,7 +14,6 @@ pub fn modulate(bits: &[u8], modulation: Modulation) -> Vec<Complex32> {
         Modulation::Qam16 => modulate_16qam(bits),
         Modulation::Qam64 => modulate_64qam(bits),
         Modulation::Qam256 => modulate_256qam(bits),
-        Modulation::Qam1024 => modulate_1024qam(bits),
     }
 }
 
@@ -27,7 +26,6 @@ pub fn soft_demodulate(symbols: &[Complex32], modulation: Modulation) -> Vec<f32
         Modulation::Qam16 => soft_demod_16qam(symbols),
         Modulation::Qam64 => soft_demod_64qam(symbols),
         Modulation::Qam256 => soft_demod_256qam(symbols),
-        Modulation::Qam1024 => soft_demod_1024qam(symbols),
     }
 }
 
@@ -251,74 +249,6 @@ fn soft_demod_256qam(symbols: &[Complex32]) -> Vec<f32> {
     soft
 }
 
-// --- 1024QAM ---
-// Gray-coded 32×32 constellation: 10 bits per symbol (5 I + 5 Q).
-// Each axis uses Gray mapping: b0,b1,b2,b3,b4 → {±31,±29,...,±3,±1}/√682
-//   b0=0 → positive, b0=1 → negative
-//   b1..b4 Gray: 0000→31, 0001→29, 0011→27, ..., 1000→1
-// Normalized to unit average power (scale by 1/√682).
-
-fn qam1024_amplitude(b0: u8, b1: u8, b2: u8, b3: u8, b4: u8) -> f32 {
-    let sign = if b0 == 0 { 1.0 } else { -1.0 };
-    let mag = match (b1, b2, b3, b4) {
-        (0, 0, 0, 0) => 31.0,
-        (0, 0, 0, 1) => 29.0,
-        (0, 0, 1, 1) => 27.0,
-        (0, 0, 1, 0) => 25.0,
-        (0, 1, 1, 0) => 23.0,
-        (0, 1, 1, 1) => 21.0,
-        (0, 1, 0, 1) => 19.0,
-        (0, 1, 0, 0) => 17.0,
-        (1, 1, 0, 0) => 15.0,
-        (1, 1, 0, 1) => 13.0,
-        (1, 1, 1, 1) => 11.0,
-        (1, 1, 1, 0) => 9.0,
-        (1, 0, 1, 0) => 7.0,
-        (1, 0, 1, 1) => 5.0,
-        (1, 0, 0, 1) => 3.0,
-        (1, 0, 0, 0) => 1.0,
-        _ => unreachable!(),
-    };
-    sign * mag
-}
-
-fn modulate_1024qam(bits: &[u8]) -> Vec<Complex32> {
-    assert!(bits.len() % 10 == 0, "1024QAM needs bits divisible by 10");
-    let d = 682.0f32.sqrt();
-    bits.chunks_exact(10)
-        .map(|c| {
-            let i = qam1024_amplitude(c[0], c[1], c[2], c[3], c[4]);
-            let q = qam1024_amplitude(c[5], c[6], c[7], c[8], c[9]);
-            Complex32::new(i / d, q / d)
-        })
-        .collect()
-}
-
-fn soft_demod_1024qam(symbols: &[Complex32]) -> Vec<f32> {
-    let d = 682.0f32.sqrt();
-    let scale = 4.0 / d;
-    let t2 = 2.0 / d;
-    let t4 = 4.0 / d;
-    let t8 = 8.0 / d;
-    let t16 = 16.0 / d;
-    let mut soft = Vec::with_capacity(symbols.len() * 10);
-    for s in symbols {
-        // I-axis: b0 (sign), b1 (half), b2 (quarter), b3 (eighth), b4 (sixteenth)
-        soft.push(scale * s.re);
-        soft.push(scale * (s.re.abs() - t16));
-        soft.push(scale * ((s.re.abs() - t16).abs() - t8));
-        soft.push(scale * (((s.re.abs() - t16).abs() - t8).abs() - t4));
-        soft.push(scale * ((((s.re.abs() - t16).abs() - t8).abs() - t4).abs() - t2));
-        // Q-axis: b5 (sign), b6 (half), b7 (quarter), b8 (eighth), b9 (sixteenth)
-        soft.push(scale * s.im);
-        soft.push(scale * (s.im.abs() - t16));
-        soft.push(scale * ((s.im.abs() - t16).abs() - t8));
-        soft.push(scale * (((s.im.abs() - t16).abs() - t8).abs() - t4));
-        soft.push(scale * ((((s.im.abs() - t16).abs() - t8).abs() - t4).abs() - t2));
-    }
-    soft
-}
-
 /// Apply differential encoding: each output symbol is input[i] * prev_output.
 pub fn differential_encode(symbols: &[Complex32]) -> Vec<Complex32> {
     let mut out = Vec::with_capacity(symbols.len());
@@ -375,6 +305,85 @@ fn snap_to_psk(s: Complex32, m: usize, phase_offset: f32) -> Complex32 {
     let step = 2.0 * PI / m as f32;
     let nearest = ((angle - phase_offset) / step).round() * step + phase_offset;
     Complex32::new(nearest.cos(), nearest.sin())
+}
+
+/// Modulate bits into complex symbols using a per-band bitloading profile.
+///
+/// Iterates over bands in the profile, consuming the appropriate number of bits
+/// per band and modulating with that band's QAM order. Null bands produce
+/// zero-valued carriers.
+///
+/// `bits`: coded bit stream for one OFDM symbol.
+/// `profile`: per-band modulation levels.
+/// `num_data_carriers`: total data carriers (pilots excluded).
+///
+/// Returns one Complex32 per data carrier.
+pub fn modulate_bitloaded(
+    bits: &[u8],
+    profile: &BitloadProfile,
+    num_data_carriers: usize,
+) -> Vec<Complex32> {
+    let boundaries = profile.band_boundaries(num_data_carriers);
+    let mut result = Vec::with_capacity(num_data_carriers);
+    let mut bit_pos = 0;
+
+    for (i, &(start, end)) in boundaries.iter().enumerate() {
+        let width = end - start;
+        let level = profile.bands[i];
+        let bps = level.bits_per_symbol();
+
+        if bps == 0 {
+            // Null band: zero carriers, no bits consumed
+            result.extend(std::iter::repeat(Complex32::new(0.0, 0.0)).take(width));
+        } else {
+            let band_bits = width * bps;
+            let band_slice = &bits[bit_pos..bit_pos + band_bits];
+            let modulated = modulate(band_slice, level.to_modulation());
+            result.extend_from_slice(&modulated);
+            bit_pos += band_bits;
+        }
+    }
+
+    result
+}
+
+/// Soft-demodulate complex symbols using a per-band bitloading profile.
+///
+/// Iterates over bands, soft-demodulating each with its QAM order.
+/// Null bands produce no soft bits (their carriers are skipped).
+///
+/// `symbols`: one Complex32 per data carrier.
+/// `profile`: per-band modulation levels.
+/// `num_data_carriers`: total data carriers (pilots excluded).
+///
+/// Returns soft bits (LLR-like values), count = profile.coded_bits_per_symbol().
+pub fn soft_demodulate_bitloaded(
+    symbols: &[Complex32],
+    profile: &BitloadProfile,
+    num_data_carriers: usize,
+) -> Vec<f32> {
+    let boundaries = profile.band_boundaries(num_data_carriers);
+    let total_bits = profile.coded_bits_per_symbol(num_data_carriers);
+    let mut result = Vec::with_capacity(total_bits);
+    let mut sym_pos = 0;
+
+    for (i, &(start, end)) in boundaries.iter().enumerate() {
+        let width = end - start;
+        let level = profile.bands[i];
+        let bps = level.bits_per_symbol();
+
+        if bps == 0 {
+            // Null band: skip carriers, no soft bits produced
+            sym_pos += width;
+        } else {
+            let band_symbols = &symbols[sym_pos..sym_pos + width];
+            let soft = soft_demodulate(band_symbols, level.to_modulation());
+            result.extend_from_slice(&soft);
+            sym_pos += width;
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -452,27 +461,6 @@ mod tests {
     }
 
     #[test]
-    fn test_1024qam_roundtrip() {
-        // Test all 1024 constellation points
-        let mut bits = Vec::new();
-        for i in 0..1024u16 {
-            for b in (0..10).rev() {
-                bits.push(((i >> b) & 1) as u8);
-            }
-        }
-        let symbols = modulate_1024qam(&bits);
-        assert_eq!(symbols.len(), 1024);
-
-        // Verify unit average power
-        let avg_power: f32 = symbols.iter().map(|s| s.norm_sqr()).sum::<f32>() / symbols.len() as f32;
-        assert!((avg_power - 1.0).abs() < 0.02, "Average power = {}, expected ~1.0", avg_power);
-
-        let soft = soft_demod_1024qam(&symbols);
-        let hard: Vec<u8> = soft.iter().map(|&s| if s > 0.0 { 0 } else { 1 }).collect();
-        assert_eq!(hard, bits);
-    }
-
-    #[test]
     fn test_differential_roundtrip() {
         let bits = vec![0, 1, 1, 0];
         let symbols = modulate_bpsk(&bits);
@@ -481,5 +469,79 @@ mod tests {
         let soft = soft_demod_bpsk(&decoded);
         let hard: Vec<u8> = soft.iter().map(|&s| if s > 0.0 { 0 } else { 1 }).collect();
         assert_eq!(hard, bits);
+    }
+
+    /// Bitloaded modulation with null bands: null carriers are zero,
+    /// non-null carriers modulate correctly, bit counts match.
+    #[test]
+    fn test_modulate_bitloaded_with_null_bands() {
+        use crate::params::{BitloadProfile, BitloadLevel, BITLOAD_BANDS};
+
+        let mut bands = [BitloadLevel::Qpsk; BITLOAD_BANDS];
+        bands[3] = BitloadLevel::Null;
+        bands[4] = BitloadLevel::Null;
+        let profile = BitloadProfile { bands };
+        let num_dc = 48; // 3 per band
+
+        let total_bits = profile.coded_bits_per_symbol(num_dc);
+        // 14 bands * 3 carriers * 2 bps = 84, 2 null bands contribute 0
+        assert_eq!(total_bits, 14 * 3 * 2);
+
+        let bits: Vec<u8> = (0..total_bits).map(|i| (i % 2) as u8).collect();
+        let symbols = modulate_bitloaded(&bits, &profile, num_dc);
+        assert_eq!(symbols.len(), num_dc);
+
+        // Null band carriers (indices 9..15) should be zero
+        let boundaries = profile.band_boundaries(num_dc);
+        let (null_start, null_end) = (boundaries[3].0, boundaries[4].1);
+        for i in null_start..null_end {
+            assert_eq!(symbols[i], Complex32::new(0.0, 0.0),
+                "Null band carrier {} should be zero", i);
+        }
+
+        // Soft demod should recover all non-null bits
+        let soft = soft_demodulate_bitloaded(&symbols, &profile, num_dc);
+        assert_eq!(soft.len(), total_bits);
+        let hard: Vec<u8> = soft.iter().map(|&s| if s > 0.0 { 0 } else { 1 }).collect();
+        assert_eq!(hard, bits);
+    }
+
+    /// Bitloaded modulation with mixed QAM levels round-trips at symbol level.
+    #[test]
+    fn test_modulate_bitloaded_mixed_levels_roundtrip() {
+        use crate::params::{BitloadProfile, BitloadLevel, BITLOAD_BANDS};
+
+        // Each band: a different modulation level
+        let mut bands = [BitloadLevel::Qpsk; BITLOAD_BANDS];
+        bands[0] = BitloadLevel::Bpsk;
+        bands[1] = BitloadLevel::Qam16;
+        bands[2] = BitloadLevel::Qam64;
+        bands[3] = BitloadLevel::Qam256;
+        let profile = BitloadProfile { bands };
+        let num_dc = 64; // 4 per band
+
+        let total_bits = profile.coded_bits_per_symbol(num_dc);
+        let bits: Vec<u8> = (0..total_bits).map(|i| (i % 2) as u8).collect();
+        let symbols = modulate_bitloaded(&bits, &profile, num_dc);
+        assert_eq!(symbols.len(), num_dc);
+
+        let soft = soft_demodulate_bitloaded(&symbols, &profile, num_dc);
+        assert_eq!(soft.len(), total_bits);
+        let hard: Vec<u8> = soft.iter().map(|&s| if s > 0.0 { 0 } else { 1 }).collect();
+        assert_eq!(hard, bits);
+    }
+
+    /// A mismatched bit count causes modulate_bitloaded to panic due to slicing.
+    /// This demonstrates that an out-of-sync profile can crash the encoder.
+    #[test]
+    #[should_panic]
+    fn test_modulate_bitloaded_panics_on_short_bits() {
+        use crate::params::{BitloadProfile, BitloadLevel};
+
+        let profile = BitloadProfile::uniform(BitloadLevel::Qpsk);
+        let num_dc = 64;
+        let total_bits = profile.coded_bits_per_symbol(num_dc);
+        let bits = vec![0u8; total_bits.saturating_sub(1)];
+        let _ = modulate_bitloaded(&bits, &profile, num_dc);
     }
 }

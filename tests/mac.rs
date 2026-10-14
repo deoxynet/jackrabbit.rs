@@ -32,7 +32,7 @@ fn run_until_idle(a: &mut HalfDuplexMac, b: &mut HalfDuplexMac, chunk: usize, ma
     max_steps
 }
 
-// 8. Unidirectional transfer: A sends 1 payload to B
+// 1. Unidirectional transfer: A sends 1 payload to B
 #[test]
 fn test_mac_unidirectional_transfer() {
     let mut a = HalfDuplexMac::new(0, 1.0);
@@ -50,7 +50,7 @@ fn test_mac_unidirectional_transfer() {
     assert!(b.recv().is_none());
 }
 
-// 9. Bidirectional exchange: A sends first, then B sends back
+// 2. Bidirectional exchange: A sends first, then B sends back
 #[test]
 fn test_mac_bidirectional_exchange() {
     let mut a = HalfDuplexMac::new(0, 1.0);
@@ -77,7 +77,7 @@ fn test_mac_bidirectional_exchange() {
     assert_eq!(payload, b"from B");
 }
 
-// 10. Burst transfer: 16 payloads through one direction (full window)
+// 3. Burst transfer: 16 payloads through one direction (full window)
 #[test]
 fn test_mac_burst_transfer() {
     let mut a = HalfDuplexMac::new(0, 1.0);
@@ -105,7 +105,7 @@ fn test_mac_burst_transfer() {
     }
 }
 
-// 11. Lost frame recovery: zero out one frame's samples, verify timeout + retransmit
+// 4. Lost frame recovery: zero out one frame's samples, verify timeout + retransmit
 #[test]
 fn test_mac_lost_frame_recovery() {
     let mut a = HalfDuplexMac::new(0, 1.0);
@@ -139,7 +139,7 @@ fn test_mac_lost_frame_recovery() {
     assert_eq!(payload, b"recover me");
 }
 
-// 12. Wired mode round-trip
+// 5. Wired mode round-trip
 #[test]
 fn test_mac_wired_mode() {
     let proto = 13u8; // WIRED_TURBO
@@ -159,7 +159,7 @@ fn test_mac_wired_mode() {
     assert_eq!(payload, b"wired transfer");
 }
 
-// 13. Sustained transfer: 48 payloads, all delivered in order
+// 6. Sustained transfer: 48 payloads, all delivered in order
 #[test]
 fn test_mac_sustained_transfer() {
     let mut a = HalfDuplexMac::new(0, 1.0);
@@ -202,7 +202,7 @@ fn test_mac_sustained_transfer() {
     }
 }
 
-// 14. Throughput benchmark: measure bytes/sec through MAC loopback for each protocol class
+// 7. Throughput benchmark: measure bytes/sec through MAC loopback for each protocol class
 #[test]
 fn test_mac_throughput_benchmark() {
     let sample_rate = 48_000usize;
@@ -221,7 +221,6 @@ fn test_mac_throughput_benchmark() {
         Case { name: "DT_FAST (QPSK 1/2)", proto: 4, wired: false, payload_size: 200, num_payloads: 16 },
         Case { name: "UT_FASTEST (QAM16 3/4)", proto: 11, wired: false, payload_size: 2000, num_payloads: 16 },
         Case { name: "WIRED_TURBO (QAM256 3/4 LDPC)", proto: 13, wired: true, payload_size: 1000, num_payloads: 32 },
-        Case { name: "WIRED_EXTREME (QAM1024 5/6 LDPC)", proto: 16, wired: true, payload_size: 2000, num_payloads: 32 },
     ];
 
     eprintln!("\n--- MAC Throughput Benchmark ---");
@@ -261,6 +260,69 @@ fn test_mac_throughput_benchmark() {
             received.push(p);
         }
         assert_eq!(received.len(), case.num_payloads, "{}: payload count mismatch", case.name);
+
+        let total_bytes = case.num_payloads * case.payload_size;
+        let duration_secs = total_samples as f64 / sample_rate as f64;
+        let throughput_bps = (total_bytes as f64 * 8.0) / duration_secs;
+
+        eprintln!(
+            "  {:40} {:5} B x {:3} = {:6} B in {:6.2}s = {:8.0} bps ({:.1} kbps)",
+            case.name,
+            case.payload_size,
+            case.num_payloads,
+            total_bytes,
+            duration_secs,
+            throughput_bps,
+            throughput_bps / 1000.0,
+        );
+    }
+
+    // Pipelined mode (stop_and_wait = false)
+    eprintln!("\n--- Pipelined Mode (window=32) ---");
+    for case in &cases {
+        let config = params::get_protocol(case.proto);
+        let (mut a, mut b) = if case.wired {
+            (
+                HalfDuplexMac::new_wired(case.proto, 1.0, config.cp_len),
+                HalfDuplexMac::new_wired(case.proto, 1.0, config.cp_len),
+            )
+        } else {
+            (
+                HalfDuplexMac::new(case.proto, 1.0),
+                HalfDuplexMac::new(case.proto, 1.0),
+            )
+        };
+
+        // Pipelining only helps wired (OTA half-duplex needs ACK time between bursts)
+        if case.wired {
+            a.set_stop_and_wait(false);
+            b.set_stop_and_wait(false);
+            a.set_burst_limit(8);
+            b.set_burst_limit(8);
+        }
+
+        let payload: Vec<u8> = (0..case.payload_size).map(|i| (i % 256) as u8).collect();
+        for _ in 0..case.num_payloads {
+            a.enqueue(payload.clone());
+        }
+        a.poll(0);
+
+        let mut total_samples = 0usize;
+        let max_steps = 20_000;
+        for _ in 0..max_steps {
+            if a.is_idle() {
+                break;
+            }
+            step(&mut a, &mut b, chunk);
+            total_samples += chunk;
+        }
+        assert!(a.is_idle(), "{} (pipelined): transfer did not complete", case.name);
+
+        let mut received = Vec::new();
+        while let Some(p) = b.recv() {
+            received.push(p);
+        }
+        assert_eq!(received.len(), case.num_payloads, "{} (pipelined): payload count mismatch", case.name);
 
         let total_bytes = case.num_payloads * case.payload_size;
         let duration_secs = total_samples as f64 / sample_rate as f64;

@@ -92,6 +92,14 @@ pub struct Decoder {
     /// Cable-only modes use 1 to save overhead.
     training_symbols: usize,
 
+    /// Optional data-symbol CP override (for cable mode).
+    data_cp_override: Option<usize>,
+
+    /// Optional bitloading profile for per-band demodulation.
+    /// When set, the decoder uses per-band QAM orders instead of the
+    /// protocol's uniform modulation.
+    bitload_profile: Option<params::BitloadProfile>,
+
     // Diagnostics
     total_samples_fed: u64,
     recent_max_amplitude: f32,
@@ -125,6 +133,8 @@ impl Decoder {
             last_channel_report: None,
             overhead_cp: params::CP_LEN,
             training_symbols: params::TRAINING_SYMBOLS,
+            data_cp_override: None,
+            bitload_profile: None,
             total_samples_fed: 0,
             recent_max_amplitude: 0.0,
             recent_rms_sum: 0.0,
@@ -146,6 +156,17 @@ impl Decoder {
     pub fn set_training_symbols(&mut self, n: usize) {
         assert!(n >= 1 && n <= 2, "Training symbols must be 1 or 2");
         self.training_symbols = n;
+    }
+
+    /// Override the cyclic prefix length for data symbols.
+    pub fn set_data_cp_override(&mut self, cp_len: usize) {
+        self.data_cp_override = Some(cp_len);
+    }
+
+    /// Set the bitloading profile for per-band demodulation.
+    /// Must match the profile used by the encoder. Call before feeding samples.
+    pub fn set_bitload_profile(&mut self, profile: params::BitloadProfile) {
+        self.bitload_profile = Some(profile);
     }
 
     /// Overhead symbol total length (FFT + overhead CP).
@@ -391,7 +412,7 @@ impl Decoder {
 
     fn process_training(&mut self) {
         // Use fixed training band for channel estimation so it works for any protocol.
-        // Must cover the widest protocol (WIRED_EXTREME: bins 5–475).
+        // Must cover the widest protocol (WIRED_TURBO/WIRED_MAX: bins 20–400).
         let bin_start = params::TRAINING_BIN_START;
         let bin_end = params::TRAINING_BIN_END;
 
@@ -541,7 +562,15 @@ impl Decoder {
             self.protocol_config = Some(config);
             self.header_info = Some(info);
             self.payload_len = info.payload_len;
-            self.n_data_symbols = config.data_symbols_for(info.payload_len);
+            // Compute data symbol count — if bitloading is active, use the
+            // profile's coded_bits_per_symbol instead of the uniform one.
+            self.n_data_symbols = if let Some(ref profile) = self.bitload_profile {
+                let coded_bits = config.coded_bits_for(info.payload_len);
+                let per_sym = profile.coded_bits_per_symbol(config.num_data_carriers());
+                if per_sym > 0 { (coded_bits + per_sym - 1) / per_sym } else { 0 }
+            } else {
+                config.data_symbols_for(info.payload_len)
+            };
             self.data_soft_bits.clear();
             self.data_symbols_collected = 0;
             true
@@ -554,11 +583,14 @@ impl Decoder {
         let config = self.protocol_config.unwrap();
         let adj_start = (config.bin_start as i32 + self.integer_cfo_bins) as usize;
         let adj_end = (config.bin_end as i32 + self.integer_cfo_bins) as usize;
-        let data_sym_total = config.symbol_total();
-        let use_differential = config.modulation != params::Modulation::Qam16
+        let data_cp_len = self.data_cp_override.unwrap_or(config.cp_len);
+        let data_sym_total = params::FFT_SIZE + data_cp_len;
+        // When bitloading is active, always use coherent detection — see
+        // encoder.rs for the rationale (QAM amplitude, null band propagation).
+        let use_differential = self.bitload_profile.is_none()
+            && config.modulation != params::Modulation::Qam16
             && config.modulation != params::Modulation::Qam64
-            && config.modulation != params::Modulation::Qam256
-            && config.modulation != params::Modulation::Qam1024;
+            && config.modulation != params::Modulation::Qam256;
 
         let pilot_bins = config.pilot_bins();
         let known_pilots = params::pilot_symbols(pilot_bins.len());
@@ -571,7 +603,7 @@ impl Decoder {
             let sym = self.read_samples(data_sym_total).to_vec();
 
             // Full FFT for both data extraction and noise estimation
-            let full_spectrum = ofdm::fft(&sym[config.cp_len..]);
+            let full_spectrum = ofdm::fft(&sym[data_cp_len..]);
 
             // Estimate noise variance from all out-of-band bins (below and above signal).
             let half_fft = params::FFT_SIZE / 2;
@@ -619,7 +651,7 @@ impl Decoder {
                     params::Modulation::Bpsk => (2, 0.0),
                     params::Modulation::Qpsk => (8, 0.0),
                     params::Modulation::Psk8 => (8, 0.0),
-                    params::Modulation::Qam16 | params::Modulation::Qam64 | params::Modulation::Qam256 | params::Modulation::Qam1024 => unreachable!(),
+                    params::Modulation::Qam16 | params::Modulation::Qam64 | params::Modulation::Qam256 => unreachable!(),
                 };
                 modulation::differential_decode_dd(&equalized_corrected, n_phases, phase_offset)
             } else {
@@ -634,14 +666,56 @@ impl Decoder {
                 &corrected, &pilot_bins, config.bin_start, config.num_carriers(),
             );
 
-            let soft = modulation::soft_demodulate(&data_decoded, config.modulation);
+            // LLR scaling: weight soft bits by channel quality to give the
+            // FEC decoder better reliability information.
+            //
+            // Bitloaded frames use per-carrier scaling (different QAM orders
+            // per band need individual reliability weighting).
+            // Uniform frames use average scaling (more robust to small channel
+            // estimation errors on near-ideal links).
+            let scaled_soft = if let Some(ref profile) = self.bitload_profile {
+                let num_dc = config.num_data_carriers();
+                let soft = modulation::soft_demodulate_bitloaded(&data_decoded, profile, num_dc);
 
-            // Noise-aware LLR scaling: multiply raw LLR by |H|²/(2σ²).
-            let avg_h_sq: f32 = h_slice.iter().map(|h| h.norm_sqr()).sum::<f32>()
-                / h_slice.len() as f32;
-            let llr_scale = (avg_h_sq / (2.0 * noise_var)).min(100.0);
+                // Per-carrier LLR scales for bitloaded frames
+                let data_h = params::extract_data_bins(
+                    h_slice, &pilot_bins, config.bin_start, config.num_carriers(),
+                );
+                let data_h_scales = adaptive::per_subcarrier_llr_scale(
+                    &data_h, noise_var, 100.0,
+                );
 
-            let scaled_soft: Vec<f32> = soft.iter().map(|&s| s * llr_scale).collect();
+                let boundaries = profile.band_boundaries(num_dc);
+                let mut bpc = Vec::with_capacity(num_dc);
+                for (bi, &(start, end)) in boundaries.iter().enumerate() {
+                    let bps = profile.bands[bi].bits_per_symbol();
+                    for _ in start..end {
+                        bpc.push(bps);
+                    }
+                }
+
+                let mut result = Vec::with_capacity(soft.len());
+                let mut soft_idx = 0;
+                for (carrier_idx, &bps) in bpc.iter().enumerate() {
+                    let scale = data_h_scales.get(carrier_idx).copied().unwrap_or(1.0);
+                    for _ in 0..bps {
+                        if soft_idx < soft.len() {
+                            result.push(soft[soft_idx] * scale);
+                            soft_idx += 1;
+                        }
+                    }
+                }
+                result
+            } else {
+                let soft = modulation::soft_demodulate(&data_decoded, config.modulation);
+
+                // Uniform LLR scaling: avg(|H|²) / (2σ²)
+                let avg_h_sq: f32 = h_slice.iter().map(|h| h.norm_sqr()).sum::<f32>()
+                    / h_slice.len() as f32;
+                let llr_scale = (avg_h_sq / (2.0 * noise_var)).min(100.0);
+
+                soft.iter().map(|&s| s * llr_scale).collect()
+            };
 
             let deinterleaved = interleaver::deinterleave_soft(
                 &scaled_soft,
@@ -1036,5 +1110,349 @@ mod tests {
         decoder.set_overhead_cp(overhead_cp);
         let result = decoder.feed(&waveform);
         assert_eq!(result, payload, "Overhead CP decode failed for WIRED_TURBO");
+    }
+
+    /// Bitloaded encode with a uniform profile must round-trip correctly.
+    /// This is the key regression safety test.
+    #[test]
+    fn test_bitloaded_uniform_roundtrip() {
+        use crate::params::{BitloadProfile, BitloadLevel};
+        use crate::header::{HeaderInfo, FrameType};
+
+        // Test several protocols with their matching uniform bitload level
+        let test_cases: &[(u8, BitloadLevel)] = &[
+            (0, BitloadLevel::Bpsk),   // AUDIBLE_NORMAL: BPSK
+            (1, BitloadLevel::Qpsk),   // AUDIBLE_FAST: QPSK
+            (4, BitloadLevel::Qpsk),   // DT_FAST: QPSK
+            (8, BitloadLevel::Qam64),  // WIRED_FAST: QAM64
+            (14, BitloadLevel::Qam64), // WIRED_MAX: QAM64
+        ];
+
+        for &(proto, level) in test_cases {
+            let payload = b"bitload uniform test";
+            let profile = BitloadProfile::uniform(level);
+            let header = HeaderInfo {
+                frame_type: FrameType::Data,
+                seq_num: 0,
+                protocol_id: proto,
+                payload_len: payload.len(),
+            };
+            let waveform = encoder::encode_bitloaded(
+                payload, &header, 1.0,
+                params::PREAMBLE_SYMBOLS, params::CP_LEN,
+                params::TRAINING_SYMBOLS, &profile,
+            );
+
+            let mut decoder = Decoder::new();
+            decoder.set_bitload_profile(profile);
+            let result = decoder.feed(&waveform);
+            assert_eq!(
+                result, payload,
+                "Bitloaded uniform roundtrip failed for protocol {}",
+                proto,
+            );
+        }
+    }
+
+    /// Bitloaded encode with mixed modulation levels round-trips in a clean channel.
+    #[test]
+    fn test_bitloaded_mixed_roundtrip() {
+        use crate::params::{BitloadProfile, BitloadLevel, BITLOAD_BANDS};
+        use crate::header::{HeaderInfo, FrameType};
+
+        // Use protocol 4 (DT_FAST: QPSK, bins 20-120, 100 carriers)
+        let proto = 4u8;
+        let payload = b"mixed bitload test data";
+
+        // Create a profile with varying modulation: some BPSK, some QPSK, some QAM16
+        let mut bands = [BitloadLevel::Qpsk; BITLOAD_BANDS];
+        bands[0] = BitloadLevel::Bpsk;
+        bands[1] = BitloadLevel::Bpsk;
+        bands[14] = BitloadLevel::Qam16;
+        bands[15] = BitloadLevel::Qam16;
+        let profile = BitloadProfile { bands };
+
+        let header = HeaderInfo {
+            frame_type: FrameType::Data,
+            seq_num: 0,
+            protocol_id: proto,
+            payload_len: payload.len(),
+        };
+        let waveform = encoder::encode_bitloaded(
+            payload, &header, 1.0,
+            params::PREAMBLE_SYMBOLS, params::CP_LEN,
+            params::TRAINING_SYMBOLS, &profile,
+        );
+        assert!(!waveform.is_empty(), "Bitloaded encode produced empty waveform");
+
+        let mut decoder = Decoder::new();
+        decoder.set_bitload_profile(profile);
+        let result = decoder.feed(&waveform);
+        assert_eq!(
+            result, payload,
+            "Mixed bitload roundtrip failed",
+        );
+    }
+
+    /// QAM bands on a BPSK base protocol must work correctly.
+    /// This is the scenario where differential encoding would destroy QAM
+    /// amplitude info if not properly disabled for bitloaded frames.
+    /// Uses QAM64 bands which are highly sensitive to amplitude corruption,
+    /// with a large payload to push past FEC correction capacity.
+    #[test]
+    fn test_bitloaded_qam_on_differential_base_protocol() {
+        use crate::params::{BitloadProfile, BitloadLevel, BITLOAD_BANDS};
+        use crate::header::{HeaderInfo, FrameType};
+
+        // Protocol 0: AUDIBLE_NORMAL (BPSK, bins 20-80) — uses differential encoding.
+        // Profile: mostly QAM64 — amplitude-sensitive, would fail with diff encode.
+        let proto = 0u8;
+        let mut bands = [BitloadLevel::Qam64; BITLOAD_BANDS];
+        // Leave two bands at BPSK for variety
+        bands[0] = BitloadLevel::Bpsk;
+        bands[15] = BitloadLevel::Bpsk;
+        let profile = BitloadProfile { bands };
+
+        // Use a large payload that requires many data symbols — errors from
+        // amplitude corruption would exceed FEC correction capacity.
+        let payload: Vec<u8> = (0..200u16).map(|i| (i % 256) as u8).collect();
+        let header = HeaderInfo {
+            frame_type: FrameType::Data,
+            seq_num: 0,
+            protocol_id: proto,
+            payload_len: payload.len(),
+        };
+        let waveform = encoder::encode_bitloaded(
+            &payload, &header, 1.0,
+            params::PREAMBLE_SYMBOLS, params::CP_LEN,
+            params::TRAINING_SYMBOLS, &profile,
+        );
+        assert!(!waveform.is_empty());
+
+        let mut decoder = Decoder::new();
+        decoder.set_bitload_profile(profile);
+        let result = decoder.feed(&waveform);
+        assert_eq!(result, payload, "QAM64 on BPSK base should decode correctly");
+    }
+
+    /// Null bands must not corrupt adjacent carriers.
+    /// Null carriers produce zero, which would poison differential encoding
+    /// (prev becomes zero, all subsequent carriers become zero).
+    #[test]
+    fn test_bitloaded_with_null_bands() {
+        use crate::params::{BitloadProfile, BitloadLevel, BITLOAD_BANDS};
+        use crate::header::{HeaderInfo, FrameType};
+
+        // Protocol 1: AUDIBLE_FAST (QPSK, differential base)
+        let proto = 1u8;
+        let mut bands = [BitloadLevel::Qpsk; BITLOAD_BANDS];
+        // Null band in the middle — would zero-poison differential encoding
+        bands[7] = BitloadLevel::Null;
+        bands[8] = BitloadLevel::Null;
+        let profile = BitloadProfile { bands };
+
+        let payload = b"null band test payload data";
+        let header = HeaderInfo {
+            frame_type: FrameType::Data,
+            seq_num: 0,
+            protocol_id: proto,
+            payload_len: payload.len(),
+        };
+        let waveform = encoder::encode_bitloaded(
+            payload, &header, 1.0,
+            params::PREAMBLE_SYMBOLS, params::CP_LEN,
+            params::TRAINING_SYMBOLS, &profile,
+        );
+        assert!(!waveform.is_empty());
+
+        let mut decoder = Decoder::new();
+        decoder.set_bitload_profile(profile);
+        let result = decoder.feed(&waveform);
+        assert_eq!(result, payload, "Null bands in middle should not corrupt frame");
+    }
+
+    /// Wide dynamic range: BPSK and QAM256 in the same frame.
+    #[test]
+    fn test_bitloaded_wide_modulation_range() {
+        use crate::params::{BitloadProfile, BitloadLevel, BITLOAD_BANDS};
+        use crate::header::{HeaderInfo, FrameType};
+
+        // Protocol 9: UT_NORMAL (BPSK, bins 20-320, 300 carriers) — wide band
+        let proto = 9u8;
+        let mut bands = [BitloadLevel::Qpsk; BITLOAD_BANDS];
+        // Low bands: BPSK (robust). High bands: QAM256 (aggressive).
+        bands[0] = BitloadLevel::Bpsk;
+        bands[1] = BitloadLevel::Bpsk;
+        bands[14] = BitloadLevel::Qam256;
+        bands[15] = BitloadLevel::Qam256;
+        let profile = BitloadProfile { bands };
+
+        let payload: Vec<u8> = (0..300u16).map(|i| (i % 256) as u8).collect();
+        let header = HeaderInfo {
+            frame_type: FrameType::Data,
+            seq_num: 0,
+            protocol_id: proto,
+            payload_len: payload.len(),
+        };
+        let waveform = encoder::encode_bitloaded(
+            &payload, &header, 1.0,
+            params::PREAMBLE_SYMBOLS, params::CP_LEN,
+            params::TRAINING_SYMBOLS, &profile,
+        );
+        assert!(!waveform.is_empty());
+
+        let mut decoder = Decoder::new();
+        decoder.set_bitload_profile(profile);
+        let result = decoder.feed(&waveform);
+        assert_eq!(result, payload, "BPSK+QAM256 wide-range profile should decode");
+    }
+
+    /// Bitloading on a QAM base protocol (coherent detection, no differential).
+    /// This should work regardless of the diff encoding fix since QAM protocols
+    /// never used differential in the first place.
+    #[test]
+    fn test_bitloaded_on_qam_base_protocol() {
+        use crate::params::{BitloadProfile, BitloadLevel, BITLOAD_BANDS};
+        use crate::header::{HeaderInfo, FrameType};
+
+        // Protocol 8: WIRED_FAST (QAM64, LDPC, bins 20-320) — coherent base
+        let proto = 8u8;
+        let mut bands = [BitloadLevel::Qam64; BITLOAD_BANDS];
+        bands[0] = BitloadLevel::Qpsk;
+        bands[1] = BitloadLevel::Qam16;
+        bands[14] = BitloadLevel::Qam256;
+        bands[15] = BitloadLevel::Qam256;
+        let profile = BitloadProfile { bands };
+
+        let payload: Vec<u8> = (0..400u16).map(|i| (i % 256) as u8).collect();
+        let header = HeaderInfo {
+            frame_type: FrameType::Data,
+            seq_num: 0,
+            protocol_id: proto,
+            payload_len: payload.len(),
+        };
+        let waveform = encoder::encode_bitloaded(
+            &payload, &header, 1.0,
+            params::PREAMBLE_SYMBOLS, params::CP_LEN,
+            params::TRAINING_SYMBOLS, &profile,
+        );
+        assert!(!waveform.is_empty());
+
+        let mut decoder = Decoder::new();
+        decoder.set_bitload_profile(profile);
+        let result = decoder.feed(&waveform);
+        assert_eq!(result, payload, "Bitloaded QAM base protocol should decode");
+    }
+
+    /// Mixed profile survives moderate noise (15 dB SNR).
+    /// Validates that bitloaded soft demod + per-carrier LLR scaling
+    /// works under realistic conditions, not just clean loopback.
+    #[test]
+    fn test_bitloaded_mixed_with_noise() {
+        use crate::params::{BitloadProfile, BitloadLevel, BITLOAD_BANDS};
+        use crate::header::{HeaderInfo, FrameType};
+        use crate::impairments;
+
+        // Protocol 4: DT_FAST (QPSK, bins 20-120)
+        let proto = 4u8;
+        // Conservative profile: nothing above QPSK so FEC can handle 15 dB
+        let mut bands = [BitloadLevel::Qpsk; BITLOAD_BANDS];
+        bands[0] = BitloadLevel::Bpsk;
+        bands[15] = BitloadLevel::Bpsk;
+        let profile = BitloadProfile { bands };
+
+        let payload = b"noisy bitload test";
+        let header = HeaderInfo {
+            frame_type: FrameType::Data,
+            seq_num: 0,
+            protocol_id: proto,
+            payload_len: payload.len(),
+        };
+        let waveform = encoder::encode_bitloaded(
+            payload, &header, 1.0,
+            params::PREAMBLE_SYMBOLS, params::CP_LEN,
+            params::TRAINING_SYMBOLS, &profile,
+        );
+
+        let noisy = impairments::apply_awgn(&waveform, 15.0, 42);
+        let mut decoder = Decoder::new();
+        decoder.set_bitload_profile(profile);
+        let result = decoder.feed(&noisy);
+        assert_eq!(result, payload, "Bitloaded BPSK/QPSK should survive 15 dB SNR");
+    }
+
+    /// Decoding a uniform ACK frame with a non-uniform bitload profile should fail.
+    /// This demonstrates that control frames become undecodable once bitloading is active.
+    #[test]
+    fn test_ack_decode_fails_with_bitload_profile() {
+        use crate::params::{BitloadProfile, BitloadLevel, BITLOAD_BANDS};
+        use crate::phy::PhyFrame;
+
+        let proto = 4u8; // DT_FAST (QPSK)
+        let ack = PhyFrame::ack(0, proto, 0);
+        let samples = ack.encode_full(
+            1.0,
+            params::PREAMBLE_SYMBOLS,
+            params::CP_LEN,
+            params::TRAINING_SYMBOLS,
+        );
+
+        let mut decoder = Decoder::new();
+        assert!(
+            decoder.feed_frame(&samples).is_some(),
+            "ACK should decode with the default (uniform) demodulator",
+        );
+
+        let mut bands = [BitloadLevel::Null; BITLOAD_BANDS];
+        bands[0] = BitloadLevel::Qpsk; // very low per-symbol bit budget
+        let profile = BitloadProfile { bands };
+
+        let mut bitloaded = Decoder::new();
+        bitloaded.set_bitload_profile(profile);
+        assert!(
+            bitloaded.feed_frame(&samples).is_none(),
+            "ACK should fail when decoder expects a bitloaded frame",
+        );
+    }
+
+    /// A bitloaded data frame should not decode without a matching profile.
+    /// This demonstrates the need for on-wire profile signaling.
+    #[test]
+    fn test_bitloaded_decode_without_profile_fails() {
+        use crate::params::{BitloadProfile, BitloadLevel, BITLOAD_BANDS};
+        use crate::header::{HeaderInfo, FrameType};
+
+        let proto = 4u8; // DT_FAST (QPSK)
+        let payload = b"bitload mismatch test";
+
+        // Extremely low-rate profile: only 2 bands active
+        let mut bands = [BitloadLevel::Null; BITLOAD_BANDS];
+        bands[0] = BitloadLevel::Qpsk;
+        bands[1] = BitloadLevel::Qpsk;
+        let profile = BitloadProfile { bands };
+
+        let header = HeaderInfo {
+            frame_type: FrameType::Data,
+            seq_num: 0,
+            protocol_id: proto,
+            payload_len: payload.len(),
+        };
+        let waveform = encoder::encode_bitloaded(
+            payload,
+            &header,
+            1.0,
+            params::PREAMBLE_SYMBOLS,
+            params::CP_LEN,
+            params::TRAINING_SYMBOLS,
+            &profile,
+        );
+        assert!(!waveform.is_empty(), "Bitloaded encode should produce output");
+
+        let mut decoder = Decoder::new(); // no profile set
+        let result = decoder.feed(&waveform);
+        assert!(
+            result.is_empty(),
+            "Decoder without matching profile should fail to decode",
+        );
     }
 }

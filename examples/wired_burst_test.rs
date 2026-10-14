@@ -1,4 +1,4 @@
-use aqua_soundbin::arq::SelectiveRepeat;
+use aqua_soundbin::arq::KcpArq;
 use aqua_soundbin::params;
 use aqua_soundbin::decoder::Decoder;
 
@@ -7,18 +7,18 @@ fn main() {
     let config = params::get_protocol(proto);
 
     // Build 2 wired frames with gap
-    let mut sender = SelectiveRepeat::new_wired(proto, 1.0, config.cp_len);
-    let f0 = sender.send(b"w0").unwrap();
-    let f1 = sender.send(b"w1").unwrap();
+    let mut sender = KcpArq::new_wired(proto, 1.0, config.cp_len);
+    sender.send(b"w0");
+    sender.send(b"w1");
+    // Poll to get encoded samples (KCP batches output)
+    let samples = sender.poll(0).expect("should produce samples");
     let gap = vec![0.0f32; 9600];
 
     let mut stream: Vec<f32> = Vec::new();
-    stream.extend_from_slice(&f0);
+    stream.extend_from_slice(&samples);
     stream.extend(&gap);
-    stream.extend_from_slice(&f1);
-    stream.extend(&gap);
-    eprintln!("Stream: {} samples (f0={} + gap={} + f1={} + gap={})",
-        stream.len(), f0.len(), gap.len(), f1.len(), gap.len());
+    eprintln!("Stream: {} samples (frames={} + gap={})",
+        stream.len(), samples.len(), gap.len());
 
     // Test 1: Feed entire stream to decoder at once
     let mut dec = Decoder::new();
@@ -59,5 +59,5 @@ fn main() {
             }
         }
     }
-    eprintln!("Chunked: decoded {}/2", decoded);
+    eprintln!("Chunked: decoded {}", decoded);
 }

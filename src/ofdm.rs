@@ -1,7 +1,7 @@
 /// OFDM modulation: IFFT synthesis, FFT analysis, cyclic prefix, Hermitian symmetry.
 
 use num_complex::Complex32;
-use rustfft::FftPlanner;
+use crate::fft::FftPlanner;
 use crate::params::{FFT_SIZE, CP_LEN};
 
 /// Place data symbols onto subcarrier bins with Hermitian symmetry for real-valued output.

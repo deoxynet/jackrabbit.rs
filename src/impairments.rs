@@ -31,7 +31,7 @@ pub fn apply_cfo(samples: &[f32], delta_f_hz: f32) -> Vec<f32> {
         .map(|&s| num_complex::Complex::new(s, 0.0))
         .collect();
 
-    let mut planner = rustfft::FftPlanner::new();
+    let mut planner = crate::fft::FftPlanner::new();
     let fft = planner.plan_fft_forward(n);
     fft.process(&mut spectrum);
 
@@ -155,7 +155,7 @@ impl LcgRng {
 // ---------------------------------------------------------------------------
 
 use num_complex::Complex;
-use rustfft::FftPlanner;
+use crate::fft::FftPlanner;
 
 /// FFT-based linear convolution. Output length = signal.len() + kernel.len() - 1.
 fn convolve_fft(signal: &[f32], kernel: &[f32]) -> Vec<f32> {

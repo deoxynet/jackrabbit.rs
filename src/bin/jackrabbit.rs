@@ -32,6 +32,7 @@ struct Config {
     protocol_id: u8,
     volume: f32,
     wired: bool,
+    cable: bool,
     input_device: Option<String>,
     output_device: Option<String>,
     tun_ip: String,
@@ -49,6 +50,7 @@ fn parse_args() -> Config {
     let mut protocol_id: u8 = 0;
     let mut volume: f32 = 0.8;
     let mut wired = false;
+    let mut cable = false;
     let mut input_device: Option<String> = None;
     let mut output_device: Option<String> = None;
     let mut tun_ip = "10.73.0.1".to_string();
@@ -80,6 +82,10 @@ fn parse_args() -> Config {
                 volume = value.parse().expect("Invalid volume");
             }
             "--wired" => wired = true,
+            "--cable" => {
+                cable = true;
+                wired = true;
+            }
             "--input" => {
                 let value = require_arg(&args, &mut i, "--input");
                 input_device = Some(value);
@@ -151,6 +157,30 @@ fn parse_args() -> Config {
         std::process::exit(1);
     }
 
+    let proto_config = params::get_protocol(protocol_id);
+    let overhead_cp_len = if cable {
+        params::CP_LEN_CABLE
+    } else if wired {
+        proto_config.cp_len
+    } else {
+        params::CP_LEN
+    };
+    let data_cp_len = if cable {
+        params::CP_LEN_CABLE
+    } else {
+        proto_config.cp_len
+    };
+    let preamble_symbols = if wired {
+        params::PREAMBLE_SYMBOLS_MINIMAL
+    } else {
+        params::PREAMBLE_SYMBOLS
+    };
+    let training_symbols = if wired {
+        params::TRAINING_SYMBOLS_SHORT
+    } else {
+        params::TRAINING_SYMBOLS
+    };
+
     // MTU: auto-compute from protocol unless user overrides.
     let (tun_mtu, mtu_is_auto) = if let Some(mtu) = mtu_override {
         let clamped = mtu.min(params::MAX_PAYLOAD as u32);
@@ -162,7 +192,18 @@ fn parse_args() -> Config {
         }
         (clamped, false)
     } else {
-        let auto = params::recommended_mtu(protocol_id, wired, target_frame_ms) as u32;
+        let auto = if cable {
+            recommended_mtu_custom(
+                protocol_id,
+                target_frame_ms,
+                preamble_symbols,
+                training_symbols,
+                overhead_cp_len,
+                data_cp_len,
+            ) as u32
+        } else {
+            params::recommended_mtu(protocol_id, wired, target_frame_ms) as u32
+        };
         let floored = auto.max(MIN_IPV4_MTU);
         if auto < MIN_IPV4_MTU {
             eprintln!(
@@ -194,6 +235,7 @@ fn parse_args() -> Config {
         protocol_id,
         volume,
         wired,
+        cable,
         input_device,
         output_device,
         tun_ip,
@@ -213,8 +255,9 @@ fn print_help() {
     eprintln!("Usage: sudo jackrabbit [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --protocol N         OFDM protocol ID (0-16, default: 0)");
+    eprintln!("  --protocol N         OFDM protocol ID (0-15, default: 0)");
     eprintln!("  --wired              Wired mode (short preamble, minimal CP)");
+    eprintln!("  --cable              Cable mode (3.5mm jack, minimal CP)");
     eprintln!("  --volume V           TX volume 0.0-1.0 (default: 0.8)");
     eprintln!("  --input NAME         Audio input device (substring match)");
     eprintln!("  --output NAME        Audio output device (substring match)");
@@ -232,10 +275,82 @@ fn print_help() {
     eprintln!("  OTA fast:        --protocol 11                  (~10-27 kbps, excellent SNR)");
     eprintln!("  Wired:           --protocol 8 --wired           (~30-50 kbps)");
     eprintln!("  Wired fast:      --protocol 13 --wired          (~50-80 kbps)");
-    eprintln!("  Wired extreme:   --protocol 16 --wired          (~80-100+ kbps, 3.5mm cable)");
+    eprintln!("  Cable:           --protocol 13 --cable          (~50-80 kbps, short CP)");
     eprintln!();
     eprintln!("Environment:");
     eprintln!("  JACKRABBIT_DEBUG=1   Show decoder state in periodic stats");
+}
+
+// ---------------------------------------------------------------------------
+// Framing helpers
+// ---------------------------------------------------------------------------
+
+fn total_samples_for_payload(
+    config: &params::ProtocolConfig,
+    payload_len: usize,
+    preamble_symbols: usize,
+    training_symbols: usize,
+    overhead_cp_len: usize,
+    data_cp_len: usize,
+) -> usize {
+    let n_data = config.data_symbols_for(payload_len);
+    let overhead_sym_total = params::FFT_SIZE + overhead_cp_len;
+    let data_sym_total = params::FFT_SIZE + data_cp_len;
+    let fixed_symbols = preamble_symbols + training_symbols + params::HEADER_SYMBOLS;
+    fixed_symbols * overhead_sym_total + n_data * data_sym_total
+}
+
+fn frame_duration_ms_custom(
+    protocol_id: u8,
+    payload_len: usize,
+    preamble_symbols: usize,
+    training_symbols: usize,
+    overhead_cp_len: usize,
+    data_cp_len: usize,
+) -> f64 {
+    let config = params::get_protocol(protocol_id);
+    let samples = total_samples_for_payload(
+        config,
+        payload_len,
+        preamble_symbols,
+        training_symbols,
+        overhead_cp_len,
+        data_cp_len,
+    );
+    samples as f64 / SAMPLE_RATE as f64 * 1000.0
+}
+
+fn recommended_mtu_custom(
+    protocol_id: u8,
+    target_ms: u32,
+    preamble_symbols: usize,
+    training_symbols: usize,
+    overhead_cp_len: usize,
+    data_cp_len: usize,
+) -> usize {
+    let config = params::get_protocol(protocol_id);
+    let target_samples = (SAMPLE_RATE as u64 * target_ms as u64 / 1000) as usize;
+    let mut lo = 1usize;
+    let mut hi = params::MAX_PAYLOAD;
+    let mut best = 1usize;
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let samples = total_samples_for_payload(
+            config,
+            mid,
+            preamble_symbols,
+            training_symbols,
+            overhead_cp_len,
+            data_cp_len,
+        );
+        if samples <= target_samples {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid.saturating_sub(1);
+        }
+    }
+    best.min(params::MAX_PAYLOAD).max(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -557,13 +672,38 @@ fn main() {
     }
 
     let proto_config = params::get_protocol(config.protocol_id);
+    let overhead_cp_len = if config.cable {
+        params::CP_LEN_CABLE
+    } else if config.wired {
+        proto_config.cp_len
+    } else {
+        params::CP_LEN
+    };
+    let data_cp_len = if config.cable {
+        params::CP_LEN_CABLE
+    } else {
+        proto_config.cp_len
+    };
+    let preamble_symbols = if config.wired {
+        params::PREAMBLE_SYMBOLS_MINIMAL
+    } else {
+        params::PREAMBLE_SYMBOLS
+    };
+    let training_symbols = if config.wired {
+        params::TRAINING_SYMBOLS_SHORT
+    } else {
+        params::TRAINING_SYMBOLS
+    };
 
     // --- Create and configure MAC ---
     let mut mac = if config.wired {
-        HalfDuplexMac::new_wired(config.protocol_id, config.volume, proto_config.cp_len)
+        HalfDuplexMac::new_wired(config.protocol_id, config.volume, overhead_cp_len)
     } else {
         HalfDuplexMac::new(config.protocol_id, config.volume)
     };
+    if config.cable {
+        mac.set_data_cp_override(data_cp_len);
+    }
 
     // Burst and flow control
     mac.set_burst_limit(config.burst_limit);
@@ -571,35 +711,64 @@ fn main() {
     // OTA with burst == 1: keep stop-and-wait for reliability.
     mac.set_stop_and_wait(config.burst_limit <= 1);
 
-    // Timeouts: scale with actual frame duration.
-    // Timeout = time for peer to receive our frame + quiet detection + ACK encode + ACK transmit.
-    let data_frame_ms = params::frame_duration_ms(
-        config.protocol_id, config.tun_mtu as usize, config.wired,
+    // Timeouts: must account for the full path from TX end to ACK reception.
+    //   data_frame + output_ring_drain + ack_quiet_threshold + ack_frame
+    // We compute the actual ack_quiet below, so use a placeholder here and
+    // set the final timeout after configuring the quiet threshold.
+    let data_frame_ms = frame_duration_ms_custom(
+        config.protocol_id,
+        config.tun_mtu as usize,
+        preamble_symbols,
+        training_symbols,
+        overhead_cp_len,
+        data_cp_len,
     );
-    let ack_frame_ms = params::frame_duration_ms(
-        config.protocol_id, 1, config.wired,
+    let ack_frame_ms = frame_duration_ms_custom(
+        config.protocol_id,
+        1,
+        preamble_symbols,
+        training_symbols,
+        overhead_cp_len,
+        data_cp_len,
     );
-    let round_trip_ms = data_frame_ms + ack_frame_ms;
-    let timeout_ms = if config.wired {
-        // Wired: tight timeout (2x round-trip, min 300ms)
-        (round_trip_ms * 2.0).max(300.0) as u64
+
+    // Inter-frame gap, output ring sizing, and ACK quiet threshold.
+    //
+    // Key invariant: the output ring must drain within gap_samples so the
+    // peer's carrier sense (gap_samples of silence) guarantees our echo
+    // gate has reopened before their preamble arrives.
+    //
+    // The ack_quiet_threshold must exceed the sender's ring drain time so
+    // the receiver waits for the sender's echo gate to open before
+    // flushing the deferred ACK.
+    let sym_total = params::FFT_SIZE + data_cp_len;
+    let min_ring = 2048_usize; // 2 audio callback buffers — prevents underruns
+    if config.wired {
+        mac.set_gap(sym_total);
+        mac.set_ack_quiet_threshold(sym_total.max(min_ring) + sym_total);
     } else {
-        // OTA: generous timeout (3x round-trip, min 1000ms)
-        (round_trip_ms * 3.0).max(1000.0) as u64
+        mac.set_ack_quiet_threshold(params::SYMBOL_TOTAL * 2 + sym_total);
+    }
+
+    // Timeout: data_frame + ack_quiet + ack_frame + safety margin.
+    let gap_samples = if config.wired { sym_total } else { params::SYMBOL_TOTAL * 2 };
+    let ack_quiet_ms = (gap_samples.max(min_ring) + sym_total) as f64 * 1000.0 / SAMPLE_RATE as f64;
+    let round_trip_ms = data_frame_ms + ack_quiet_ms + ack_frame_ms;
+    let timeout_ms = if config.wired {
+        (round_trip_ms * 2.0).max(500.0) as u64
+    } else {
+        (round_trip_ms * 2.5).max(1500.0) as u64
     };
     mac.set_timeout(timeout_ms * SAMPLE_RATE as u64 / 1000);
 
-    // Inter-frame gap and ACK quiet threshold
-    let sym_total = proto_config.symbol_total();
-    if config.wired {
-        // Wired: minimal gap (1 symbol), quick ACK flush (3 symbols)
-        mac.set_gap(sym_total);
-        mac.set_ack_quiet_threshold(sym_total * 3);
-    }
-    // OTA: keep defaults (2 symbols gap, 4 symbols quiet)
-
     // --- Startup banner ---
-    let mode_str = if config.wired { "wired" } else { "OTA" };
+    let mode_str = if config.cable {
+        "cable"
+    } else if config.wired {
+        "wired"
+    } else {
+        "OTA"
+    };
     let mtu_str = if config.mtu_is_auto {
         format!("{} (auto, {}ms target)", config.tun_mtu, config.target_frame_ms)
     } else {
@@ -811,7 +980,9 @@ fn main() {
         // of the burst in its own output_buf.  This way is_transmitting()
         // stays true (and the echo gate stays active) for the duration of
         // the actual playback — not just the instant we copy into the ring.
-        let max_ring_ahead = SAMPLE_RATE as usize / 5; // 200ms buffer ahead
+        // The ring size matches gap_samples so it drains within one
+        // carrier-sense period, keeping the echo gate blind period short.
+        let max_ring_ahead = gap_samples.max(min_ring);
         let backlog = {
             let mut ring = output_ring.lock().unwrap();
             let headroom = max_ring_ahead.saturating_sub(ring.len());

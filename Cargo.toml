@@ -12,8 +12,9 @@ path = "src/bin/jackrabbit.rs"
 required-features = ["cli"]
 
 [dependencies]
-rustfft = "6.2"
 num-complex = "0.4"
+num-traits = "0.2"
+kcp = "0.6"
 cpal = { version = "0.15", optional = true }
 libc = { version = "0.2", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }

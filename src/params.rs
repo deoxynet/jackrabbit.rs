@@ -36,6 +36,114 @@ pub const PILOT_SPACING: usize = 10;
 /// Offset of first pilot from bin_start.
 pub const PILOT_OFFSET: usize = 5;
 
+/// Number of frequency bands for adaptive bitloading.
+pub const BITLOAD_BANDS: usize = 16;
+
+/// Modulation level for a single bitloading band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitloadLevel {
+    Null,   // 0 bits — carrier is zeroed
+    Bpsk,   // 1 bit/symbol
+    Qpsk,   // 2 bits/symbol
+    Qam16,  // 4 bits/symbol
+    Qam64,  // 6 bits/symbol
+    Qam256, // 8 bits/symbol
+}
+
+impl BitloadLevel {
+    pub fn bits_per_symbol(self) -> usize {
+        match self {
+            BitloadLevel::Null => 0,
+            BitloadLevel::Bpsk => 1,
+            BitloadLevel::Qpsk => 2,
+            BitloadLevel::Qam16 => 4,
+            BitloadLevel::Qam64 => 6,
+            BitloadLevel::Qam256 => 8,
+        }
+    }
+
+    /// Convert to the corresponding Modulation variant (panics for Null).
+    pub fn to_modulation(self) -> Modulation {
+        match self {
+            BitloadLevel::Null => panic!("Null band has no modulation"),
+            BitloadLevel::Bpsk => Modulation::Bpsk,
+            BitloadLevel::Qpsk => Modulation::Qpsk,
+            BitloadLevel::Qam16 => Modulation::Qam16,
+            BitloadLevel::Qam64 => Modulation::Qam64,
+            BitloadLevel::Qam256 => Modulation::Qam256,
+        }
+    }
+}
+
+/// Per-subcarrier bitloading profile: each of BITLOAD_BANDS frequency bands
+/// can use a different modulation level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitloadProfile {
+    pub bands: [BitloadLevel; BITLOAD_BANDS],
+}
+
+impl BitloadProfile {
+    /// Create a uniform profile where all bands use the same modulation.
+    pub fn uniform(level: BitloadLevel) -> Self {
+        BitloadProfile {
+            bands: [level; BITLOAD_BANDS],
+        }
+    }
+
+    /// Create a uniform profile from a Modulation variant.
+    pub fn from_modulation(modulation: Modulation) -> Self {
+        let level = match modulation {
+            Modulation::Bpsk => BitloadLevel::Bpsk,
+            Modulation::Qpsk | Modulation::Psk8 => BitloadLevel::Qpsk,
+            Modulation::Qam16 => BitloadLevel::Qam16,
+            Modulation::Qam64 => BitloadLevel::Qam64,
+            Modulation::Qam256 => BitloadLevel::Qam256,
+        };
+        Self::uniform(level)
+    }
+
+    /// Compute the band boundaries (start_carrier_index, end_carrier_index) for
+    /// each band within a protocol's carrier range. Bands divide the data
+    /// carriers (excluding pilots) as evenly as possible.
+    pub fn band_boundaries(&self, num_data_carriers: usize) -> Vec<(usize, usize)> {
+        let mut boundaries = Vec::with_capacity(BITLOAD_BANDS);
+        let base = num_data_carriers / BITLOAD_BANDS;
+        let extra = num_data_carriers % BITLOAD_BANDS;
+        let mut pos = 0;
+        for i in 0..BITLOAD_BANDS {
+            let width = base + if i < extra { 1 } else { 0 };
+            boundaries.push((pos, pos + width));
+            pos += width;
+        }
+        boundaries
+    }
+
+    /// Total coded bits per OFDM data symbol for this bitloading profile.
+    pub fn coded_bits_per_symbol(&self, num_data_carriers: usize) -> usize {
+        let boundaries = self.band_boundaries(num_data_carriers);
+        let mut total = 0;
+        for (i, &(start, end)) in boundaries.iter().enumerate() {
+            let width = end - start;
+            total += width * self.bands[i].bits_per_symbol();
+        }
+        total
+    }
+
+    /// Number of data symbols needed for a given number of coded bits.
+    pub fn data_symbols_for_coded_bits(&self, coded_bits: usize, num_data_carriers: usize) -> usize {
+        let per_sym = self.coded_bits_per_symbol(num_data_carriers);
+        if per_sym == 0 {
+            return 0;
+        }
+        (coded_bits + per_sym - 1) / per_sym
+    }
+
+    /// Whether all bands use the same modulation level.
+    pub fn is_uniform(&self) -> bool {
+        self.bands.iter().all(|&b| b == self.bands[0])
+    }
+}
+
 /// Modulation scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Modulation {
@@ -45,7 +153,6 @@ pub enum Modulation {
     Qam16, // 4 bits/symbol — Gray-coded 4×4 constellation
     Qam64,  // 6 bits/symbol — Gray-coded 8×8 constellation
     Qam256,  // 8 bits/symbol — Gray-coded 16×16 constellation
-    Qam1024, // 10 bits/symbol — Gray-coded 32×32 constellation
 }
 
 impl Modulation {
@@ -57,7 +164,6 @@ impl Modulation {
             Modulation::Qam16 => 4,
             Modulation::Qam64 => 6,
             Modulation::Qam256 => 8,
-            Modulation::Qam1024 => 10,
         }
     }
 }
@@ -230,7 +336,7 @@ impl ProtocolConfig {
 }
 
 /// All protocol configurations.
-pub static PROTOCOLS: [ProtocolConfig; 17] = [
+pub static PROTOCOLS: [ProtocolConfig; 16] = [
     // Audible: 1–4 kHz → bins 20–80 (60 carriers)
     ProtocolConfig { id: 0, name: "AUDIBLE_NORMAL",  bin_start: 20, bin_end: 80,  modulation: Modulation::Bpsk, code_rate: CodeRate::Half,        fec_type: FecType::Convolutional, cp_len: CP_LEN, pilot_spacing: PILOT_SPACING },
     ProtocolConfig { id: 1, name: "AUDIBLE_FAST",    bin_start: 20, bin_end: 80,  modulation: Modulation::Qpsk, code_rate: CodeRate::Half,        fec_type: FecType::Convolutional, cp_len: CP_LEN, pilot_spacing: PILOT_SPACING },
@@ -253,14 +359,49 @@ pub static PROTOCOLS: [ProtocolConfig; 17] = [
     ProtocolConfig { id: 14, name: "WIRED_MAX",        bin_start: 20, bin_end: 400, modulation: Modulation::Qam64, code_rate: CodeRate::ThreeFourth, fec_type: FecType::Ldpc, cp_len: CP_LEN_MINIMAL, pilot_spacing: 15 },
     // OTA-robust: audible band, BPSK 1/2 LDPC, full CP, dense pilots
     ProtocolConfig { id: 15, name: "OTA_ROBUST",      bin_start: 20, bin_end: 80,  modulation: Modulation::Bpsk,  code_rate: CodeRate::Half,        fec_type: FecType::Ldpc, cp_len: CP_LEN, pilot_spacing: 5 },
-    // Wired extreme: 3.5mm cable, max throughput. 1024QAM, rate 5/6 LDPC, near-full bandwidth, minimal CP/pilots.
-    ProtocolConfig { id: 16, name: "WIRED_EXTREME",   bin_start: 5,  bin_end: 475, modulation: Modulation::Qam1024, code_rate: CodeRate::FiveSixth,  fec_type: FecType::Ldpc, cp_len: CP_LEN_CABLE, pilot_spacing: 60 },
 ];
 
+/// First protocol ID reserved for bitloaded variants.
+/// Protocol IDs [BITLOAD_PROTO_BASE .. 31] signal that the frame uses
+/// per-band adaptive modulation on top of the base protocol at
+/// `id - BITLOAD_PROTO_BASE`.
+pub const BITLOAD_PROTO_BASE: u8 = 16;
+
 pub fn get_protocol(id: u8) -> &'static ProtocolConfig {
+    let base = if id >= BITLOAD_PROTO_BASE {
+        (id - BITLOAD_PROTO_BASE) as usize
+    } else {
+        id as usize
+    };
     PROTOCOLS
-        .get(id as usize)
+        .get(base)
         .unwrap_or_else(|| panic!("invalid protocol id {}", id))
+}
+
+/// Returns true if the protocol ID indicates a bitloaded frame.
+pub fn is_bitloaded_protocol(id: u8) -> bool {
+    id >= BITLOAD_PROTO_BASE && ((id - BITLOAD_PROTO_BASE) as usize) < PROTOCOLS.len()
+}
+
+/// Extract the base protocol ID from a (possibly bitloaded) protocol ID.
+pub fn base_protocol_id(id: u8) -> u8 {
+    if id >= BITLOAD_PROTO_BASE {
+        id - BITLOAD_PROTO_BASE
+    } else {
+        id
+    }
+}
+
+/// Compute the bitloaded protocol ID for a base protocol.
+/// Returns None if the base protocol doesn't support bitloading
+/// (i.e., base_id + BITLOAD_PROTO_BASE > 31).
+pub fn bitloaded_protocol_id(base_id: u8) -> Option<u8> {
+    let bitloaded = base_id + BITLOAD_PROTO_BASE;
+    if bitloaded <= 31 && (base_id as usize) < PROTOCOLS.len() {
+        Some(bitloaded)
+    } else {
+        None
+    }
 }
 
 /// Recommend a maximum payload size that keeps one-way frame duration under target_ms.
@@ -379,5 +520,128 @@ mod tests {
 
         assert!(coded_bits < coded_per_sym);
         assert!(total_bits > coded_bits);
+    }
+
+    #[test]
+    fn test_bitload_uniform_matches_protocol() {
+        // A uniform bitload profile should produce the same coded_bits_per_symbol
+        // as the protocol's existing calculation.
+        for config in PROTOCOLS.iter() {
+            let profile = BitloadProfile::from_modulation(config.modulation);
+            let num_dc = config.num_data_carriers();
+            let bitloaded = profile.coded_bits_per_symbol(num_dc);
+            let uniform = config.coded_bits_per_symbol();
+            // Psk8 maps to Qpsk in from_modulation (different bits_per_symbol),
+            // so skip it.
+            if config.modulation == Modulation::Psk8 {
+                continue;
+            }
+            assert_eq!(
+                bitloaded, uniform,
+                "Protocol {} ({}) bitload mismatch: {} vs {}",
+                config.id, config.name, bitloaded, uniform
+            );
+        }
+    }
+
+    #[test]
+    fn test_bitload_band_boundaries_cover_all_carriers() {
+        let profile = BitloadProfile::uniform(BitloadLevel::Qpsk);
+        for num_dc in [50, 90, 128, 290, 380, 460] {
+            let bounds = profile.band_boundaries(num_dc);
+            assert_eq!(bounds.len(), BITLOAD_BANDS);
+            assert_eq!(bounds[0].0, 0);
+            assert_eq!(bounds.last().unwrap().1, num_dc);
+            // No gaps
+            for i in 1..bounds.len() {
+                assert_eq!(bounds[i].0, bounds[i-1].1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_bitload_null_band_produces_zero_bits() {
+        let mut profile = BitloadProfile::uniform(BitloadLevel::Qam64);
+        profile.bands[0] = BitloadLevel::Null;
+        let num_dc = 160;
+        let bps = profile.coded_bits_per_symbol(num_dc);
+        // Should be less than all-64QAM
+        let full = BitloadProfile::uniform(BitloadLevel::Qam64).coded_bits_per_symbol(num_dc);
+        assert!(bps < full, "Null band should reduce coded bits per symbol");
+        assert!(bps > 0, "Should still have some bits from other bands");
+    }
+
+    #[test]
+    fn test_bitloaded_protocol_id_roundtrip() {
+        for base in 0..PROTOCOLS.len() as u8 {
+            if let Some(bl_id) = bitloaded_protocol_id(base) {
+                assert!(is_bitloaded_protocol(bl_id));
+                assert_eq!(base_protocol_id(bl_id), base);
+                // get_protocol should return the base config
+                let config = get_protocol(bl_id);
+                assert_eq!(config.id, base);
+            }
+        }
+    }
+
+    /// All 16 base protocols (0-15) can have bitloaded variants (16-31).
+    #[test]
+    fn test_bitloaded_protocol_id_range() {
+        // Every base protocol fits: 0+16=16, 15+16=31, all within 5-bit space
+        for base in 0..PROTOCOLS.len() as u8 {
+            assert!(bitloaded_protocol_id(base).is_some(),
+                "Base protocol {} should have a bitloaded variant", base);
+        }
+        // IDs below BITLOAD_PROTO_BASE are base protocols, not bitloaded
+        assert!(!is_bitloaded_protocol(0));
+        assert!(!is_bitloaded_protocol(15));
+        // Highest valid bitloaded ID: 15 + 16 = 31
+        assert!(is_bitloaded_protocol(31));
+        assert_eq!(base_protocol_id(31), 15);
+    }
+
+    /// All-null profile: coded_bits_per_symbol is 0, data_symbols_for_coded_bits is 0.
+    #[test]
+    fn test_bitload_all_null_profile() {
+        let profile = BitloadProfile::uniform(BitloadLevel::Null);
+        assert_eq!(profile.coded_bits_per_symbol(100), 0);
+        assert_eq!(profile.data_symbols_for_coded_bits(100, 100), 0);
+    }
+
+    /// Band boundaries with odd carrier counts: bands get uneven sizes.
+    #[test]
+    fn test_bitload_band_boundaries_odd_carriers() {
+        let profile = BitloadProfile::uniform(BitloadLevel::Qpsk);
+
+        // 17 carriers / 16 bands = 1 carrier per band + 1 extra in first band
+        let bounds = profile.band_boundaries(17);
+        assert_eq!(bounds[0], (0, 2)); // first band gets extra
+        assert_eq!(bounds[1], (2, 3));
+        assert_eq!(bounds[15], (16, 17));
+        assert_eq!(bounds.last().unwrap().1, 17);
+
+        // 1 carrier: only first band has a carrier, rest are empty
+        let bounds = profile.band_boundaries(1);
+        assert_eq!(bounds[0], (0, 1));
+        for i in 1..BITLOAD_BANDS {
+            assert_eq!(bounds[i].0, bounds[i].1,
+                "Band {} should be empty with 1 carrier", i);
+        }
+    }
+
+    /// coded_bits_per_symbol is correct with mixed-width bands on odd carrier count.
+    #[test]
+    fn test_bitload_coded_bits_odd_carriers() {
+        let mut profile = BitloadProfile::uniform(BitloadLevel::Qpsk); // 2 bps
+        profile.bands[0] = BitloadLevel::Qam16; // 4 bps for first band
+
+        // 33 carriers / 16 bands = 2 base + 1 extra in first band (3 carriers)
+        // band 0: 3 carriers * 4 bps = 12
+        // bands 1-15: 2 carriers * 2 bps = 4 each, total = 60
+        // Total = 12 + 60 = 72
+        let bps = profile.coded_bits_per_symbol(33);
+        let bounds = profile.band_boundaries(33);
+        assert_eq!(bounds[0], (0, 3)); // 2 + 1 extra
+        assert_eq!(bps, 3 * 4 + 15 * 2 * 2);
     }
 }
