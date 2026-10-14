@@ -3,10 +3,10 @@
 /// These tests define the API contract for CFO handling and will fail
 /// until the estimator and corrector are implemented.
 
-use aqua_soundbin::encoder;
-use aqua_soundbin::decoder::Decoder;
-use aqua_soundbin::impairments;
-use aqua_soundbin::preamble;
+use jackrabbit::encoder;
+use jackrabbit::decoder::Decoder;
+use jackrabbit::impairments;
+use jackrabbit::preamble;
 
 // ---------------------------------------------------------------------------
 // Fractional CFO estimation

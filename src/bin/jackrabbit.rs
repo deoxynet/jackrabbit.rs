@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, StreamConfig};
 
-use aqua_soundbin::mac::HalfDuplexMac;
-use aqua_soundbin::params;
+use jackrabbit::mac::HalfDuplexMac;
+use jackrabbit::params;
 
 const SAMPLE_RATE: u32 = 48_000;
 /// IPv4 minimum reassembly buffer; floor for TUN MTU.

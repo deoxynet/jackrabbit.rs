@@ -6,7 +6,7 @@ A from-scratch OFDM audio modem in Rust. Turns any audio channel into a data lin
 
 ## What is this?
 
-JackRabbit (`aqua-soundbin`) is a complete PHY/modem layer that encodes data into audio waveforms and decodes it back. It implements the same signal processing techniques used in WiFi and LTE, but over audio frequencies.
+JackRabbit (`jackrabbit`) is a complete PHY/modem layer that encodes data into audio waveforms and decodes it back. It implements the same signal processing techniques used in WiFi and LTE, but over audio frequencies.
 
 - **OFDM** with 960-point FFT at 48kHz
 - **Modulation** from BPSK to 256-QAM
@@ -91,35 +91,37 @@ Burst pipelining (burst >= 2) disables stop-and-wait ARQ. The link saturates at 
 ## Installation
 
 ```bash
-cargo add aqua-soundbin
+cargo add jackrabbit --git https://github.com/deoxynet/jackrabbit.rs
 ```
 
 ## Usage
 
 ```rust
-use aqua_soundbin::{encode, decode, Protocol};
+use jackrabbit::{decoder::Decoder, encoder};
 
 // Encode data to audio samples
 let data = b"hop the air gap";
-let samples = encode(data, Protocol::UT_FASTEST);
+let samples = encoder::encode(data, 11, 1.0); // UT_FASTEST
 
 // ... transmit samples over audio channel ...
 
 // Decode received audio back to data
-let received = decode(&samples, Protocol::UT_FASTEST)?;
+let mut decoder = Decoder::new();
+let received = decoder.feed(&samples);
+assert_eq!(received, data);
 ```
 
 ## Dependencies
 
 Minimal:
-- `rustfft` 6.2 — FFT operations
+- Bundled FFT implementation — FFT operations
 - `num-complex` 0.4 — complex number support
+- `num-traits` 0.2 — numeric traits for FFT operations
+- `kcp` 0.6 — reliable transport
 
 Optional:
-- `wasm-bindgen` / `js-sys` — browser builds (behind `wasm` feature)
-
-Dev only:
-- `cpal` 0.15 — audio I/O for examples
+- `wasm-bindgen` / `wasm-bindgen-futures` / `js-sys` — browser builds (behind `wasm` feature)
+- `cpal` 0.15 / `libc` 0.2 — native audio I/O and TUN support (behind `cli` feature)
 
 ## Platform Support
 
@@ -138,7 +140,7 @@ Also: air-gapped machines still have headphone jacks. Bluetooth headsets are eve
 
 ## License
 
-MIT — Kevin Pham ([@irdbl](https://github.com/irdbl)) <k@vin-ph.am>
+MIT — Kevin Pham ([@deoxykev](https://github.com/deoxykev)) <k@vin-ph.am>
 
 ---
 

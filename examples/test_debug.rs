@@ -1,10 +1,10 @@
-use aqua_soundbin::encoder;
-use aqua_soundbin::decoder::Decoder;
-use aqua_soundbin::impairments;
-use aqua_soundbin::fec;
-use aqua_soundbin::ofdm;
-use aqua_soundbin::crc;
-use aqua_soundbin::params::{self, SYMBOL_TOTAL, PREAMBLE_SYMBOLS, TRAINING_SYMBOLS, HEADER_SYMBOLS};
+use jackrabbit::encoder;
+use jackrabbit::decoder::Decoder;
+use jackrabbit::impairments;
+use jackrabbit::fec;
+use jackrabbit::ofdm;
+use jackrabbit::crc;
+use jackrabbit::params::{self, SYMBOL_TOTAL, PREAMBLE_SYMBOLS, TRAINING_SYMBOLS, HEADER_SYMBOLS};
 
 fn main() {
     let payload = b"noise-aware LLR";

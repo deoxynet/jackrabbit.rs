@@ -34,21 +34,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aqua-soundbin"
-version = "0.1.0"
-dependencies = [
- "cpal",
- "js-sys",
- "kcp",
- "libc",
- "num-complex",
- "num-traits",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -313,6 +298,21 @@ name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
+
+[[package]]
+name = "jackrabbit"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "js-sys",
+ "kcp",
+ "libc",
+ "num-complex",
+ "num-traits",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+]
 
 [[package]]
 name = "jni"

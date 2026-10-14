@@ -1,8 +1,8 @@
 /// Phase 3 coverage: LDPC codes and adaptive protocol selection.
 
-use aqua_soundbin::decoder::Decoder;
-use aqua_soundbin::encoder;
-use aqua_soundbin::params::{self, FecType};
+use jackrabbit::decoder::Decoder;
+use jackrabbit::encoder;
+use jackrabbit::params::{self, FecType};
 
 fn find_ldpc_protocols() -> Vec<&'static params::ProtocolConfig> {
     params::PROTOCOLS

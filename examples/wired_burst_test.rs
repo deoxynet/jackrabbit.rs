@@ -1,6 +1,6 @@
-use aqua_soundbin::arq::KcpArq;
-use aqua_soundbin::params;
-use aqua_soundbin::decoder::Decoder;
+use jackrabbit::arq::KcpArq;
+use jackrabbit::params;
+use jackrabbit::decoder::Decoder;
 
 fn main() {
     let proto = 13u8;

@@ -4,8 +4,8 @@
 /// transfers, burst delivery, lost-frame recovery, wired mode, and
 /// sustained throughput.
 
-use aqua_soundbin::mac::HalfDuplexMac;
-use aqua_soundbin::params;
+use jackrabbit::mac::HalfDuplexMac;
+use jackrabbit::params;
 
 /// Simulate one half-duplex audio exchange step between two MACs.
 ///

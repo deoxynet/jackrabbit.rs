@@ -1,4 +1,4 @@
-use aqua_soundbin::params;
+use jackrabbit::params;
 
 fn main() {
     for &(proto_id, payload, preamble, cp, training) in &[

@@ -3,10 +3,10 @@
 /// These tests define the API contract for pilot-based channel tracking
 /// and will fail until pilot infrastructure is implemented.
 
-use aqua_soundbin::encoder;
-use aqua_soundbin::decoder::Decoder;
-use aqua_soundbin::ofdm;
-use aqua_soundbin::params::{self, FFT_SIZE, CP_LEN, SYMBOL_TOTAL, PREAMBLE_SYMBOLS, TRAINING_SYMBOLS, HEADER_SYMBOLS};
+use jackrabbit::encoder;
+use jackrabbit::decoder::Decoder;
+use jackrabbit::ofdm;
+use jackrabbit::params::{self, FFT_SIZE, CP_LEN, SYMBOL_TOTAL, PREAMBLE_SYMBOLS, TRAINING_SYMBOLS, HEADER_SYMBOLS};
 use num_complex::Complex32;
 
 // ---------------------------------------------------------------------------

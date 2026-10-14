@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, StreamConfig};
 
-use aqua_soundbin::decoder::Decoder;
-use aqua_soundbin::encoder;
-use aqua_soundbin::params;
+use jackrabbit::decoder::Decoder;
+use jackrabbit::encoder;
+use jackrabbit::params;
 
 const TARGET_SAMPLE_RATE: u32 = 48_000;
 

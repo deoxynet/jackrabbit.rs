@@ -3,11 +3,11 @@
 /// These tests define the API contract for AGC and noise-aware LLR
 /// scaling and will fail until the features are implemented.
 
-use aqua_soundbin::encoder;
-use aqua_soundbin::decoder::Decoder;
-use aqua_soundbin::impairments;
-use aqua_soundbin::ofdm;
-use aqua_soundbin::params::{self, GUARD_BINS, SYMBOL_TOTAL, PREAMBLE_SYMBOLS, TRAINING_SYMBOLS, HEADER_SYMBOLS};
+use jackrabbit::encoder;
+use jackrabbit::decoder::Decoder;
+use jackrabbit::impairments;
+use jackrabbit::ofdm;
+use jackrabbit::params::{self, GUARD_BINS, SYMBOL_TOTAL, PREAMBLE_SYMBOLS, TRAINING_SYMBOLS, HEADER_SYMBOLS};
 
 // ---------------------------------------------------------------------------
 // AGC behavior

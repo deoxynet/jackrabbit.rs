@@ -2,9 +2,9 @@
 ///
 /// These tests are expected to fail until Phase 2 is implemented.
 
-use aqua_soundbin::decoder::Decoder;
-use aqua_soundbin::encoder;
-use aqua_soundbin::params::{self, ProtocolConfig, SYMBOL_TOTAL, PREAMBLE_SYMBOLS, TRAINING_SYMBOLS, HEADER_SYMBOLS};
+use jackrabbit::decoder::Decoder;
+use jackrabbit::encoder;
+use jackrabbit::params::{self, ProtocolConfig, SYMBOL_TOTAL, PREAMBLE_SYMBOLS, TRAINING_SYMBOLS, HEADER_SYMBOLS};
 
 fn find_ut_protocol() -> Option<&'static ProtocolConfig> {
     params::PROTOCOLS

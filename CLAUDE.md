@@ -1,13 +1,16 @@
-# Claude Code Guide — aqua-soundbin.rs
+# Claude Code Guide — jackrabbit.rs
 
-## Build & Deploy
+## Build
 
 ```bash
 # Run tests
 cargo test
 
-# Build WASM and deploy to ofdm.soundbin.io
-cd ~/git/aqua-soundbin.rs && wasm-pack build --release --target web --features wasm \
-  && cp pkg/aqua_soundbin.js pkg/aqua_soundbin_bg.wasm \
-  ~/git/soundbin.io-ofdm/public/wasm/ && cd ~/git/soundbin.io-ofdm && make deploy
+# Build the native CLI
+cargo build --release --features cli --bin jackrabbit
+
+# Build the browser WASM package
+wasm-pack build --release --target web --features wasm
 ```
+
+The browser build writes `pkg/jackrabbit.js` and `pkg/jackrabbit_bg.wasm`.

@@ -4,8 +4,8 @@
 /// including window management, retransmission, wired mode, multi-protocol
 /// operation, and sustained transfers.
 
-use aqua_soundbin::arq::{ArqEvent, KcpArq};
-use aqua_soundbin::params;
+use jackrabbit::arq::{ArqEvent, KcpArq};
+use jackrabbit::params;
 
 /// Helper: run a single round-trip (sender sends, receiver processes, ACKs exchanged)
 fn roundtrip(

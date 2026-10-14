@@ -9,9 +9,9 @@
 /// 5: Protocol sweep with reverb + CFO + noise
 /// 6: Noisy silence padding
 
-use aqua_soundbin::decoder::Decoder;
-use aqua_soundbin::encoder;
-use aqua_soundbin::impairments;
+use jackrabbit::decoder::Decoder;
+use jackrabbit::encoder;
+use jackrabbit::impairments;
 
 /// Helper: pad with silence before and after.
 fn pad_silence(signal: &[f32], pre_samples: usize, post_samples: usize) -> Vec<f32> {
